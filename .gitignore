@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+*.dll
+*.dylib
+
+# Builder artifacts
+build/
+build_temp/
+build_temp_new/
+dist/
+*.egg-info/
+.eggs/
+
+# Cython generated C files (assuming you want to regenerate them from .pyx)
+rcbox/*.c
+
+# VS Code
+.vscode/
+
+# Data files (potentially large)
+*.npz
+*.npy
+
+# OS generated files
+.DS_Store
+Thumbs.db

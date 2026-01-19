@@ -1,0 +1,47 @@
+{
+  "processing": {
+    "temperature_celsius": 26.0,
+    "sound_speed_ms": null,
+    "max_detection_distance_m": 3.0,
+    "sampling_frequency_hz": 50000
+  },
+  "toa_processing": {
+    "fft_size": "auto",
+    "gcc_phat_enabled": true,
+    "peak_detection_method": "hilbert_envelope",
+    "min_peak_distance_samples": 500
+  },
+  "solver": {
+    "algorithm": "RMDU",
+    "lambda_regularization": 0.050,
+    "max_iterations": 10000,
+    "convergence_epsilon": 1e-10,
+    "verbose": false
+  },
+  "alignment": {
+    "method": "procrustes",
+    "num_reference_mics": 4,
+    "reference_mic_positions_mm": [
+      [2840, 18430, 1470],
+      [2840, 13160, 1540],
+      [2840, 7920, 1580],
+      [2840, 2650, 1600]
+    ],
+    "microphone_array_indices": [3, 67, 131, 195]
+  },
+  "visualization": {
+    "enable_animation": true,
+    "animation_fps": 20,
+    "animation_frame_duration_ms": 50,
+    "point_size_3d": 8,
+    "color_sources": [1.0, 0.0, 0.0, 1.0],
+    "color_microphones": [0.0, 1.0, 0.0, 1.0]
+  },
+  "export": {
+    "output_format": "npy",
+    "save_toa_matrix": true,
+    "save_iterations": false,
+    "save_animation": true,
+    "animation_format": "mp4"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "reference_microphones": {
+    "description": "Known positions of reference microphones for antenna alignment",
+    "note": "Positions should be in meters. These are example values from the original TOA2Geo.py",
+    "positions": [
+      {
+        "id": 1,
+        "array_index": 3,
+        "description": "Reference microphone 1",
+        "xyz_meters": [0.0284, 0.1843, 0.0147]
+      },
+      {
+        "id": 2,
+        "array_index": 67,
+        "description": "Reference microphone 2",
+        "xyz_meters": [0.0284, 0.1316, 0.0154]
+      },
+      {
+        "id": 3,
+        "array_index": 131,
+        "description": "Reference microphone 3",
+        "xyz_meters": [0.0286, 0.0792, 0.0158]
+      },
+      {
+        "id": 4,
+        "array_index": 195,
+        "description": "Reference microphone 4",
+        "xyz_meters": [0.0284, 0.0265, 0.0160]
+      }
+    ],
+    "all_16_references": [
+      {"index": 3, "xyz_mm": [2840, 18430, 1470]},
+      {"index": 19, "xyz_mm": [2840, 13160, 1540]},
+      {"index": 35, "xyz_mm": [2860, 7920, 1580]},
+      {"index": 51, "xyz_mm": [2840, 2650, 1600]},
+      {"index": 67, "xyz_mm": [5320, 7900, 1570]},
+      {"index": 83, "xyz_mm": [5330, 15790, 1540]},
+      {"index": 99, "xyz_mm": [7730, 19180, 1530]},
+      {"index": 115, "xyz_mm": [7750, 16560, 1560]},
+      {"index": 131, "xyz_mm": [7710, 11290, 1530]},
+      {"index": 147, "xyz_mm": [7730, 6040, 1610]},
+      {"index": 163, "xyz_mm": [10140, 2630, 1510]},
+      {"index": 179, "xyz_mm": [10120, 13150, 1480]},
+      {"index": 195, "xyz_mm": [10120, 18400, 1550]},
+      {"index": 211, "xyz_mm": [12620, 18420, 1590]},
+      {"index": 227, "xyz_mm": [12610, 13150, 1530]},
+      {"index": 243, "xyz_mm": [12640, 7900, 1540]}
+    ]
+  },
+  "microphone_array_configuration": {
+    "total_microphones": 257,
+    "array_type": "MEMS microphone array",
+    "sampling_frequency_hz": 50000,
+    "description": "257-element MEMS microphone array (channels 1-257, 0 is counter)"
+  },
+  "processing_notes": {
+    "temperature_calibration": "Sound speed depends on temperature: C = sqrt(1.4 * 287 * (T + 273)) [m/s]",
+    "default_temperature_celsius": 26,
+    "reference_frame": "Positions in meters from array center",
+    "measurement_units": "Time in seconds, distances in meters"
+  }
+}
