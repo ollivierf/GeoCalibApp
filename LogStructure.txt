@@ -1,0 +1,47 @@
+the log file is built in the following way
+
+
+section [DEFAULT] : Empty
+section [Date]
+    Date = DD/MM/YYYY       ; unused comment   ------> The date
+    Heure = HH/MM/SS                           ------> The time
+
+section [Voies]
+    Nb_faisceaux =  integer         ------> The number of active faisceaux 
+    Nb_voies     =  integer         ------> The number of active channels
+    Nb_micros_acifs =  integer      ------> The number of active microphones
+    Nb_voies analogiques = integer  ------> The number of active analog channels
+    Nb_compteurs  = integer         ------>  The number of active analog channels
+
+section [Micros_actifs]
+    Faisceau_000  1 0 1 0 1 1 0 1 
+    ...
+    Faisceau_031  0 0 1 0 0 1 1 1 -------> 32 faisceaux of A bloc. for each faisceau 8 digits indicating the activity of the associated 8 mics
+    Faisceau_032  1 0 1 0 1 1 0 1 
+    ...
+    Faisceau_063  0 0 1 0 0 1 1 1 -------> 32 faisceaux of B bloc. idem
+    Faisceau_064  1 0 1 0 1 1 0 1 
+    ...
+    Faisceau_095  0 0 1 0 0 1 1 1 -------> 32 faisceaux of C bloc. idem
+    Faisceau_096  1 0 1 0 1 1 0 1 
+    ...
+    Faisceau_127  0 0 1 0 0 1 1 1 -------> 32 faisceaux of D bloc. idem
+    
+
+    Nb_micros_acifs must equal the sum of 1s in this table
+    the list of active mics must be recorded
+
+section [VA actives]
+    Bloc_A =   1  1  1  0
+    Bloc_B =   0  0  0  0
+    Bloc_C =   0  0  0  0
+    Bloc_D =   0  0  0  0 ----> 4 analog channels in each block, 1 for active, 0 for inactive
+
+section [Compteur actifs]
+    Compteurs =   1  0  1  0 ----> 1 counter in each block, 1 for active, 0 for inactive
+
+section [Acquisition]
+    Freq = 50000      ; (Hz) ------> Sampling frequency    ;(unit)
+    Duree = 7,6       ; (s) ------> Duration    ;(unit)
+    Nb_ech = 378849          ------> Number of samples    
+    Type = int32             ------> Data type    

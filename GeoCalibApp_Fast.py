@@ -480,6 +480,7 @@ class ProcessingThread(QThread):
         # Event to block thread until GCC validation is complete
         self.gcc_validation_event = threading.Event()
         self.gcc_validation_event.set()  # Initially set (not blocking)
+        self.validated_toa_map = None  # Store validated TOA map from main thread
         # Current processing file for progress tracking
         self.current_filename = None
         
@@ -500,15 +501,23 @@ class ProcessingThread(QThread):
                     
                     if toa is not None:
                         self.file_progress.emit(filename, 90)  # Processing complete, pending validation
-                        self.toa_maps.append(toa)
-                        self.filenames.append(filename)
-                        # Emit each map as processed for real-time visualization
-                        self.toa_map_ready.emit(filename, toa)
                         
                         # Wait for GCC validation to complete before processing next file
                         self.gcc_validation_event.clear()
+                        self.validated_toa_map = None # Reset validated map
                         self.file_progress.emit(filename, 95)  # Waiting for validation
+                        
+                        # Wait for user input in main thread
                         self.gcc_validation_event.wait(timeout=600)  # 10 minute timeout
+                        
+                        # Check if we have a validated TOA map from the dialog
+                        final_toa = self.validated_toa_map if self.validated_toa_map is not None else toa
+                        
+                        self.toa_maps.append(final_toa)
+                        self.filenames.append(filename)
+                        # Emit each map as processed for real-time visualization
+                        self.toa_map_ready.emit(filename, final_toa)
+                        
                         self.file_progress.emit(filename, 100)  # Validation complete
                         
                 except Exception as e:
@@ -605,8 +614,8 @@ class ProcessingThread(QThread):
         try:
             dat_parser = DATParser(file_path, log_file)
             
-            # Extract microphone signals
-            Mics = dat_parser.extract_microphone_signals()
+            # Extract microphone signals and Transpose to (NbMics, NbSamples)
+            Mics = dat_parser.extract_microphone_signals().T
             
             # Extract analog signals (use first analog channel as reference if available)
             vas = dat_parser.extract_analog_signals()
@@ -614,9 +623,10 @@ class ProcessingThread(QThread):
                 Ref = vas[:, 0].astype(float)
             else:
                 # Fallback: use first microphone as reference
-                Ref = Mics[:, 0].astype(float)
+                # Note: Mics is now (NbMics, NbSamples), so Ref is Mics[0, :]
+                Ref = Mics[0, :].astype(float)
             
-            NbTixels = Mics.shape[0]
+            NbTixels = Mics.shape[1]
             
             return self._compute_toa(Mics, Ref, NbTixels, filename=filename)
             
@@ -631,78 +641,101 @@ class ProcessingThread(QThread):
         if Ref.dtype != np.float64:
             Ref = Ref.astype(np.float64)
 
-        # Use Cythonized version if available
-        if TOA_FAST_AVAILABLE:
+        NbMics = Mics.shape[0]
+        NFFT = NbTixels
+        
+        # Estimate memory requirements for Cython (Output + Intermediates)
+        # NUp = 10 * NFFT
+        # Peak RAM ~ NbMics * NUp * 32 bytes (GCC float64 + Envelope float64 + Hilbert complex128)
+        # 3.7M * 256 * 32 bytes ~ 30 GB. This is risky for 16GB RAM.
+        n_up = 10 * NFFT
+        est_cython_mem_gb = (NbMics * n_up * 32) / (1024**3)
+        print(f"[ComputeTOA] Estimated Cython Peak Memory: {est_cython_mem_gb:.2f} GB")
+        
+        # Use Cython only if memory footprint is safe (e.g. < 8 GB)
+        use_cython = TOA_FAST_AVAILABLE and (est_cython_mem_gb < 8.0)
+
+        if use_cython:
+            print("[ComputeTOA] Using Fast Cython Implementation")
             toas, gcc_data = toa_processor.compute_toa_cython(
                 Mics, Ref, self.Fe, self.Tc, self.C, return_gcc_data=True
             )
             
-            # Emit GCC data to main thread for dialog display
             if filename is not None:
-                # Unpack/repack if needed or just pass what we got.
-                # The cython function returns (GCCE, tt_limited, toas, imax, Tc, C) as gcc_data[1]
-                # Wait, compute_toa_cython returns (toas, gcc_data_tuple)
-                # gcc_data_tuple is (GCCE, tt_limited, toas, imax, Tc, C)
-                # But gcc_ready expects (GCCE, tt_limited, toas, imax, Tc, C)
-                
                 self.gcc_ready.emit(filename, gcc_data)
                 self.gcc_validated_range = (0.0, 10.0)
             
             return toas
 
-        # Fallback to Python implementation
-        # GCC-PHAT processing
-        NFFT = NbTixels
-        df = self.Fe / NFFT
-        tmax = 10.0 / self.C  # Fixed to 10 meters for validation
-        
-        SRef = np.fft.rfft(Ref, NFFT)
-        SMics = np.fft.rfft(Mics, NFFT)
-        GCS = np.conj(SRef)[None, :] * (SMics) / (np.abs(SMics) * np.abs(SRef)[None, :])
-        
-        NUp = 10 * NFFT
-        dtUp = 1 / (NUp * df)
-        GCC = np.fft.irfft(GCS, NUp)
-        tt = np.arange(NUp) * dtUp
-        
-        # Limit to 10 meters and compute envelope
-        valid_idx = tt < tmax
-        GCCE = np.abs(sig.hilbert(GCC[:, valid_idx], axis=1))
-        tt_limited = tt[valid_idx]
-        
-        # Find TOAs using peaks: find all peaks, take 10 highest, use earliest
-        imax = np.zeros(GCCE.shape[0], dtype=int)
-        for i in range(GCCE.shape[0]):
-            # Find all peaks in this microphone's GCCE
-            peaks, properties = sig.find_peaks(GCCE[i, :], height=0)
+        else:
+            print("[ComputeTOA] Falling back to Memory-Efficient Python Implementation")
+            # GCC-PHAT processing (Row-by-Row to save memory)
+            df = self.Fe / NFFT
+            tmax = 10.0 / self.C  # Fixed to 10 meters for validation
             
-            if len(peaks) > 0:
-                # Get peak heights
-                peak_heights = properties['peak_heights']
+            NUp = 10 * NFFT
+            dtUp = 1 / (NUp * df)
+            
+            # Precompute Ref FFT
+            SRef = np.fft.rfft(Ref, NFFT)
+            AbsSRef = np.abs(SRef)
+            
+            # Prepare Output Arrays
+            # Calculate valid length corresponding to tmax
+            valid_len = int(tmax / dtUp) + 1
+            if valid_len > NUp: valid_len = NUp
+            
+            tt = np.arange(NUp) * dtUp
+            tt_limited = tt[:valid_len]
+            
+            # Use float32 for GCCE to save 50% memory
+            GCCE = np.zeros((NbMics, valid_len), dtype=np.float32)
+            imax = np.zeros(NbMics, dtype=int)
+            toas = np.zeros(NbMics)
+            
+            for i in range(NbMics):
+                # FFT Mic
+                SMic = np.fft.rfft(Mics[i, :], NFFT)
                 
-                # Sort by height (descending) and get indices
-                sorted_indices = np.argsort(peak_heights)[::-1]
+                # GCC-PHAT in Freq Domain
+                denom = np.abs(SMic) * AbsSRef + 1e-15
+                GCS = np.conj(SRef) * SMic / denom
                 
-                # Get top 10 peaks (or fewer if fewer than 10 exist)
-                top_peaks = peaks[sorted_indices[:min(10, len(peaks))]]
+                # IFFT
+                row_gcc = np.fft.irfft(GCS, NUp)
                 
-                # Take the first (earliest) peak among the 10 highest
-                imax[i] = np.min(top_peaks)
-            else:
-                # Fallback: use argmax if no peaks found
-                imax[i] = np.argmax(GCCE[i, :])
-        
-        # Get initial TOA values
-        toas = np.array([tt_limited[min(i, len(tt_limited)-1)] for i in imax])
-        
-        # Emit GCC data to main thread for dialog display
-        # Use default full range (0-10m)
-        if filename is not None:
-            gcc_data = (GCCE, tt_limited, toas, imax, self.Tc, self.C)
-            self.gcc_ready.emit(filename, gcc_data)
-            self.gcc_validated_range = (0.0, 10.0)
-        
-        return toas
+                # Validation Slice
+                row_valid = row_gcc[:valid_len]
+                
+                # Envelope (Hilbert)
+                row_env = np.abs(sig.hilbert(row_valid))
+                
+                # Store
+                GCCE[i, :] = row_env.astype(np.float32)
+                
+                # Peak Finding
+                peaks, properties = sig.find_peaks(row_env, height=0)
+                
+                if len(peaks) > 0:
+                    peak_heights = properties['peak_heights']
+                    sorted_indices = np.argsort(peak_heights)[::-1]
+                    top_peaks = peaks[sorted_indices[:min(10, len(peaks))]]
+                    imax[i] = np.min(top_peaks)
+                else:
+                    imax[i] = np.argmax(row_env)
+                
+                toas[i] = tt_limited[imax[i]]
+                
+                if i % 20 == 0:
+                    print(f" [ComputeTOA] Processed {i+1}/{NbMics} channels")
+            
+            if filename is not None:
+                # Construct tuple matching Cython output structure
+                gcc_data = (GCCE, tt_limited, toas, imax, self.Tc, self.C)
+                self.gcc_ready.emit(filename, gcc_data)
+                self.gcc_validated_range = (0.0, 10.0)
+            
+            return toas
     
     def _compute_dtoa(self, toas, ref_mic_idx=0):
         """Compute Differential TOA (DTOA) matrix from TOA measurements.
@@ -1916,6 +1949,10 @@ class GeoCalibApp(QMainWindow):
         if result == QDialog.Accepted:
             min_dist, max_dist = dialog.get_selected_range()
             self.statusBar().showMessage(f"GCC validated: {filename} ({min_dist:.2f}-{max_dist:.2f}m)")
+            
+            # Pass validated TOAs back to thread
+            if self.processing_thread is not None:
+                self.processing_thread.validated_toa_map = dialog.toas
         
         # Signal processing thread to continue (unblock it)
         if self.processing_thread is not None:
