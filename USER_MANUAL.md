@@ -175,8 +175,8 @@ GCC VALIDATION - file_001.h5
 #### Components Explained
 
 **Greyscale Heatmap**:
-- **Vertical axis**: Microphone index (0-256)
-- **Horizontal axis**: Time delay in seconds (0 to ~0.03s at 26°C)
+- **Horizontal axis**: Microphone index (0-256)
+- **Vertical axis**: Time delay in seconds (0 to ~0.03s at 26°C)
 - **Brightness**: Correlation strength
   - Dark: No energy
   - Bright: Strong correlation
