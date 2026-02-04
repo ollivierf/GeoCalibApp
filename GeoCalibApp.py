@@ -53,11 +53,14 @@ import warnings
 import matplotlib as plt
 try:
     from rcbox.rmds import RMDU, _Lmake, compute_Lpinv, _Slambda
+    from rcbox import toa_processor
     from scipy.spatial.distance import squareform, pdist
     import numpy.linalg as linalg
     RCBOX_AVAILABLE = True
+    TOA_FAST_AVAILABLE = True
 except ImportError:
     RCBOX_AVAILABLE = False
+    TOA_FAST_AVAILABLE = False
 
 try:
     from DATParser import DATParser
@@ -88,6 +91,11 @@ class GCCValidationDialog(QDialog):
     
     def __init__(self, filename, gcce, tt, toas, imax, temp_celsius=26, parent=None):
         super().__init__(parent)
+        
+        # Enable window resizing and maximize button
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint | Qt.WindowMaximizeButtonHint)
+        self.setSizeGripEnabled(True)
+        
         self.filename = filename
         self.gcce = gcce  # (NbMics, NbSamples)
         self.tt = tt  # Time array
@@ -472,6 +480,7 @@ class ProcessingThread(QThread):
         # Event to block thread until GCC validation is complete
         self.gcc_validation_event = threading.Event()
         self.gcc_validation_event.set()  # Initially set (not blocking)
+        self.validated_toa_map = None  # Store validated TOA map from main thread
         # Current processing file for progress tracking
         self.current_filename = None
         
@@ -492,19 +501,29 @@ class ProcessingThread(QThread):
                     
                     if toa is not None:
                         self.file_progress.emit(filename, 90)  # Processing complete, pending validation
-                        self.toa_maps.append(toa)
-                        self.filenames.append(filename)
-                        # Emit each map as processed for real-time visualization
-                        self.toa_map_ready.emit(filename, toa)
                         
                         # Wait for GCC validation to complete before processing next file
                         self.gcc_validation_event.clear()
+                        self.validated_toa_map = None # Reset validated map
                         self.file_progress.emit(filename, 95)  # Waiting for validation
+                        
+                        # Wait for user input in main thread
                         self.gcc_validation_event.wait(timeout=600)  # 10 minute timeout
+                        
+                        # Check if we have a validated TOA map from the dialog
+                        final_toa = self.validated_toa_map if self.validated_toa_map is not None else toa
+                        
+                        self.toa_maps.append(final_toa)
+                        self.filenames.append(filename)
+                        # Emit each map as processed for real-time visualization
+                        self.toa_map_ready.emit(filename, final_toa)
+                        
                         self.file_progress.emit(filename, 100)  # Validation complete
                         
                 except Exception as e:
-                    self.status.emit(f"Skipped {filename}: {str(e)}")
+                    msg = f"Skipped {filename}: {str(e)}"
+                    print(msg)
+                    self.status.emit(msg)
                     self.file_progress.emit(filename, 0)  # Reset on error
                     continue
                 
@@ -512,7 +531,9 @@ class ProcessingThread(QThread):
                 self.progress.emit(progress)
             
             if len(self.toa_maps) == 0:
-                self.error.emit("No valid TOA data could be processed")
+                msg = "No valid TOA data could be processed"
+                print(msg)
+                self.error.emit(msg)
                 return
             
             # Filter out discarded files before emitting final result
@@ -524,14 +545,18 @@ class ProcessingThread(QThread):
                     final_toa_maps.append(toa_map)
             
             if len(final_toa_maps) == 0:
-                self.error.emit("All processed files were discarded")
+                msg = "All processed files were discarded"
+                print(msg)
+                self.error.emit(msg)
                 return
             
             self.status.emit(f"Successfully processed {len(final_toa_maps)} files")
             self.finished.emit(final_filenames, final_toa_maps)
             
         except Exception as e:
-            self.error.emit(f"Processing failed: {str(e)}")
+            msg = f"Processing failed: {str(e)}"
+            print(msg)
+            self.error.emit(msg)
     
     def _process_single_file(self, file_path):
         """Extract and process TOA from a single calibration file (HDF5 or DAT)"""
@@ -589,8 +614,8 @@ class ProcessingThread(QThread):
         try:
             dat_parser = DATParser(file_path, log_file)
             
-            # Extract microphone signals
-            Mics = dat_parser.extract_microphone_signals()
+            # Extract microphone signals and Transpose to (NbMics, NbSamples)
+            Mics = dat_parser.extract_microphone_signals().T
             
             # Extract analog signals (use first analog channel as reference if available)
             vas = dat_parser.extract_analog_signals()
@@ -598,9 +623,10 @@ class ProcessingThread(QThread):
                 Ref = vas[:, 0].astype(float)
             else:
                 # Fallback: use first microphone as reference
-                Ref = Mics[:, 0].astype(float)
+                # Note: Mics is now (NbMics, NbSamples), so Ref is Mics[0, :]
+                Ref = Mics[0, :].astype(float)
             
-            NbTixels = Mics.shape[0]
+            NbTixels = Mics.shape[1]
             
             return self._compute_toa(Mics, Ref, NbTixels, filename=filename)
             
@@ -609,58 +635,107 @@ class ProcessingThread(QThread):
     
     def _compute_toa(self, Mics, Ref, NbTixels, filename=None):
         """Compute TOA using GCC-PHAT algorithm with interactive GCC validation"""
-        # GCC-PHAT processing
+        # Ensure input arrays are float64 (required for Cython processing and FFT)
+        if Mics.dtype != np.float64:
+            Mics = Mics.astype(np.float64)
+        if Ref.dtype != np.float64:
+            Ref = Ref.astype(np.float64)
+
+        NbMics = Mics.shape[0]
         NFFT = NbTixels
-        df = self.Fe / NFFT
-        tmax = 10.0 / self.C  # Fixed to 10 meters for validation
         
-        SRef = np.fft.rfft(Ref, NFFT)
-        SMics = np.fft.rfft(Mics, NFFT)
-        GCS = np.conj(SRef)[None, :] * (SMics) / (np.abs(SMics) * np.abs(SRef)[None, :])
+        # Estimate memory requirements for Cython (Output + Intermediates)
+        # NUp = 10 * NFFT
+        # Peak RAM ~ NbMics * NUp * 32 bytes (GCC float64 + Envelope float64 + Hilbert complex128)
+        # 3.7M * 256 * 32 bytes ~ 30 GB. This is risky for 16GB RAM.
+        n_up = 10 * NFFT
+        est_cython_mem_gb = (NbMics * n_up * 32) / (1024**3)
+        print(f"[ComputeTOA] Estimated Cython Peak Memory: {est_cython_mem_gb:.2f} GB")
         
-        NUp = 10 * NFFT
-        dtUp = 1 / (NUp * df)
-        GCC = np.fft.irfft(GCS, NUp)
-        tt = np.arange(NUp) * dtUp
-        
-        # Limit to 10 meters and compute envelope
-        valid_idx = tt < tmax
-        GCCE = np.abs(sig.hilbert(GCC[:, valid_idx], axis=1))
-        tt_limited = tt[valid_idx]
-        
-        # Find TOAs using peaks: find all peaks, take 10 highest, use earliest
-        imax = np.zeros(GCCE.shape[0], dtype=int)
-        for i in range(GCCE.shape[0]):
-            # Find all peaks in this microphone's GCCE
-            peaks, properties = sig.find_peaks(GCCE[i, :], height=0)
+        # Use Cython only if memory footprint is safe (e.g. < 8 GB)
+        use_cython = TOA_FAST_AVAILABLE and (est_cython_mem_gb < 8.0)
+
+        if use_cython:
+            print("[ComputeTOA] Using Fast Cython Implementation")
+            toas, gcc_data = toa_processor.compute_toa_cython(
+                Mics, Ref, self.Fe, self.Tc, self.C, return_gcc_data=True
+            )
             
-            if len(peaks) > 0:
-                # Get peak heights
-                peak_heights = properties['peak_heights']
+            if filename is not None:
+                self.gcc_ready.emit(filename, gcc_data)
+                self.gcc_validated_range = (0.0, 10.0)
+            
+            return toas
+
+        else:
+            print("[ComputeTOA] Falling back to Memory-Efficient Python Implementation")
+            # GCC-PHAT processing (Row-by-Row to save memory)
+            df = self.Fe / NFFT
+            tmax = 10.0 / self.C  # Fixed to 10 meters for validation
+            
+            NUp = 10 * NFFT
+            dtUp = 1 / (NUp * df)
+            
+            # Precompute Ref FFT
+            SRef = np.fft.rfft(Ref, NFFT)
+            AbsSRef = np.abs(SRef)
+            
+            # Prepare Output Arrays
+            # Calculate valid length corresponding to tmax
+            valid_len = int(tmax / dtUp) + 1
+            if valid_len > NUp: valid_len = NUp
+            
+            tt = np.arange(NUp) * dtUp
+            tt_limited = tt[:valid_len]
+            
+            # Use float32 for GCCE to save 50% memory
+            GCCE = np.zeros((NbMics, valid_len), dtype=np.float32)
+            imax = np.zeros(NbMics, dtype=int)
+            toas = np.zeros(NbMics)
+            
+            for i in range(NbMics):
+                # FFT Mic
+                SMic = np.fft.rfft(Mics[i, :], NFFT)
                 
-                # Sort by height (descending) and get indices
-                sorted_indices = np.argsort(peak_heights)[::-1]
+                # GCC-PHAT in Freq Domain
+                denom = np.abs(SMic) * AbsSRef + 1e-15
+                GCS = np.conj(SRef) * SMic / denom
                 
-                # Get top 10 peaks (or fewer if fewer than 10 exist)
-                top_peaks = peaks[sorted_indices[:min(10, len(peaks))]]
+                # IFFT
+                row_gcc = np.fft.irfft(GCS, NUp)
                 
-                # Take the first (earliest) peak among the 10 highest
-                imax[i] = np.min(top_peaks)
-            else:
-                # Fallback: use argmax if no peaks found
-                imax[i] = np.argmax(GCCE[i, :])
-        
-        # Get initial TOA values
-        toas = np.array([tt_limited[min(i, len(tt_limited)-1)] for i in imax])
-        
-        # Emit GCC data to main thread for dialog display
-        # Use default full range (0-10m)
-        if filename is not None:
-            gcc_data = (GCCE, tt_limited, toas, imax, self.Tc, self.C)
-            self.gcc_ready.emit(filename, gcc_data)
-            self.gcc_validated_range = (0.0, 10.0)
-        
-        return toas
+                # Validation Slice
+                row_valid = row_gcc[:valid_len]
+                
+                # Envelope (Hilbert)
+                row_env = np.abs(sig.hilbert(row_valid))
+                
+                # Store
+                GCCE[i, :] = row_env.astype(np.float32)
+                
+                # Peak Finding
+                peaks, properties = sig.find_peaks(row_env, height=0)
+                
+                if len(peaks) > 0:
+                    peak_heights = properties['peak_heights']
+                    sorted_indices = np.argsort(peak_heights)[::-1]
+                    top_peaks = peaks[sorted_indices[:min(10, len(peaks))]]
+                    imax[i] = np.min(top_peaks)
+                else:
+                    imax[i] = np.argmax(row_env)
+                
+                toas[i] = tt_limited[imax[i]]
+                
+                if i % 20 == 0:
+                    print(f" [ComputeTOA] Processed {i+1}/{NbMics} channels")
+            
+            if filename is not None:
+                # Construct tuple matching Cython output structure
+                gcc_data = (GCCE, tt_limited, toas, imax, self.Tc, self.C)
+                self.gcc_ready.emit(filename, gcc_data)
+                self.gcc_validated_range = (0.0, 10.0)
+            
+            return toas
     
     def _compute_dtoa(self, toas, ref_mic_idx=0):
         """Compute Differential TOA (DTOA) matrix from TOA measurements.
@@ -906,6 +981,11 @@ class TOAMapViewer(QDialog):
     
     def __init__(self, filenames, toa_maps, parent=None):
         super().__init__(parent)
+        
+        # Enable window resizing and maximize button
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint | Qt.WindowMaximizeButtonHint)
+        self.setSizeGripEnabled(True)
+        
         self.filenames = filenames
         self.toa_maps = toa_maps
         self.selected_indices = []
@@ -1046,6 +1126,11 @@ class DTOAMapViewer(QDialog):
     
     def __init__(self, filenames, dtoa_matrices, parent=None):
         super().__init__(parent)
+        
+        # Enable window resizing and maximize button
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint | Qt.WindowMaximizeButtonHint)
+        self.setSizeGripEnabled(True)
+        
         self.filenames = filenames
         self.dtoa_matrices = dtoa_matrices
         self.checkboxes = []
@@ -1186,11 +1271,11 @@ class DTOAMapViewer(QDialog):
 
 class AlignmentDialog(QDialog):
     """
-    Dialog for input reference microphone positions for alignment.
+    Dialog for input reference microphone positions and indices for alignment.
     
-    Allows users to specify known positions of reference microphones
-    for Procrustes-based alignment of solver geometry. Used to transform
-    computed positions to absolute coordinates.
+    Allows users to specify:
+    1. The microphone index in the main array
+    2. The known absolute position (X, Y, Z) in meters
     
     Parameters:
         num_ref_mics: Number of reference microphones to specify (default 4)
@@ -1200,27 +1285,33 @@ class AlignmentDialog(QDialog):
         super().__init__(parent)
         self.num_ref_mics = num_ref_mics
         self.ref_positions = None
+        self.mic_indices = None
         self.init_ui()
         
     def init_ui(self):
-        self.setWindowTitle("Microphone Reference Positions")
-        self.setGeometry(100, 100, 700, 500)
+        self.setWindowTitle("Reference Microphones Configuration")
+        self.setGeometry(100, 100, 800, 500)
         
         layout = QVBoxLayout()
         
         # Table for positions
         self.table = QTableWidget()
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Microphone", "X (mm)", "Y (mm)", "Z (mm)"])
+        self.table.setHorizontalHeaderLabels(["Mic Index", "X (m)", "Y (m)", "Z (m)"])
         self.table.setRowCount(self.num_ref_mics)
         
+        column_width = 150
+        for i in range(4):
+            self.table.setColumnWidth(i, column_width)
+        
         for i in range(self.num_ref_mics):
-            item = QTableWidgetItem(f"Ref {i+1}")
-            self.table.setItem(i, 0, item)
+            # Default Mic Index (0, 1, 2...)
+            self.table.setItem(i, 0, QTableWidgetItem(str(i)))
+            # Default Coordinates (0.0)
             for j in range(1, 4):
                 self.table.setItem(i, j, QTableWidgetItem("0.0"))
         
-        layout.addWidget(QLabel("Enter reference microphone positions (in mm):"))
+        layout.addWidget(QLabel("Enter microphone indices and absolute positions (in meters):"))
         layout.addWidget(self.table)
         
         # Buttons
@@ -1235,65 +1326,23 @@ class AlignmentDialog(QDialog):
         layout.addLayout(button_layout)
         self.setLayout(layout)
     
-    def get_positions(self):
-        """Return positions in meters"""
+    def get_data(self):
+        """Return mic indices and positions in meters"""
         positions = []
+        indices = []
         for i in range(self.num_ref_mics):
             try:
-                x = float(self.table.item(i, 1).text()) * 1e-3
-                y = float(self.table.item(i, 2).text()) * 1e-3
-                z = float(self.table.item(i, 3).text()) * 1e-3
+                idx = int(self.table.item(i, 0).text())
+                x = float(self.table.item(i, 1).text())
+                y = float(self.table.item(i, 2).text())
+                z = float(self.table.item(i, 3).text())
+                indices.append(idx)
                 positions.append([x, y, z])
             except ValueError:
                 raise ValueError(f"Invalid value in row {i}")
-        return np.array(positions)
+        
+        return np.array(indices, dtype=int), np.array(positions)
 
-
-class MicrophonePositionDialog(QDialog):
-    """Dialog for selecting which microphones from array correspond to reference positions"""
-    
-    def __init__(self, parent=None, total_mics=257, num_ref=4):
-        super().__init__(parent)
-        self.total_mics = total_mics
-        self.num_ref = num_ref
-        self.mic_indices = None
-        self.init_ui()
-        
-    def init_ui(self):
-        self.setWindowTitle("Select Microphone Indices")
-        self.setGeometry(100, 100, 400, 300)
-        
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel(f"Select {self.num_ref} microphone indices from array (0-{self.total_mics-1}):"))
-        
-        # Spinboxes for microphone indices
-        self.spinboxes = []
-        indices_layout = QFormLayout()
-        for i in range(self.num_ref):
-            spinbox = QSpinBox()
-            spinbox.setMinimum(0)
-            spinbox.setMaximum(self.total_mics - 1)
-            spinbox.setValue(i * (self.total_mics // self.num_ref))
-            indices_layout.addRow(f"Ref {i+1}:", spinbox)
-            self.spinboxes.append(spinbox)
-        
-        layout.addLayout(indices_layout)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        cancel_btn = QPushButton("Cancel")
-        ok_btn.clicked.connect(self.accept)
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(ok_btn)
-        button_layout.addWidget(cancel_btn)
-        
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-    
-    def get_indices(self):
-        """Return selected microphone indices"""
-        return np.array([spinbox.value() for spinbox in self.spinboxes])
 
 
 class GeoCalibApp(QMainWindow):
@@ -1638,13 +1687,9 @@ class GeoCalibApp(QMainWindow):
         # Buttons
         button_layout = QHBoxLayout()
         
-        ref_pos_btn = QPushButton("Enter Ref Positions")
+        ref_pos_btn = QPushButton("Enter Reference Data")
         ref_pos_btn.clicked.connect(self.enter_reference_positions)
         button_layout.addWidget(ref_pos_btn)
-        
-        mic_idx_btn = QPushButton("Select Mic Indices")
-        mic_idx_btn.clicked.connect(self.select_microphone_indices)
-        button_layout.addWidget(mic_idx_btn)
         
         layout.addLayout(button_layout)
         
@@ -1758,8 +1803,25 @@ class GeoCalibApp(QMainWindow):
         self.view_3d.addItem(axis)
         
         layout.addWidget(self.view_3d)
+        
+        # View controls
+        view_controls = QHBoxLayout()
+        reset_view_btn = QPushButton("Reset View (Z-axis Vertical)")
+        reset_view_btn.clicked.connect(self.reset_3d_view)
+        view_controls.addWidget(reset_view_btn)
+        layout.addLayout(view_controls)
+        
         group.setLayout(layout)
         return group
+    
+    def reset_3d_view(self):
+        """Reset 3D view to have XY plane horizontal and Z vertical"""
+        # Set elevation to 0 (side view) or small angle to see plane
+        # Usually elevation=0 means looking at horizon.
+        # But to have "XY axes horizontal" on screen (like 2D plot), we might want Top View (elevation=90).
+        # However, "Z axis vertical" usually implies a perspective view from side.
+        # Let's use a standard isometric-style view where Z is up.
+        self.view_3d.setCameraPosition(elevation=30, azimuth=45)
     
     # ==================== TOA Processing ====================
     def browse_toa_files(self):
@@ -1814,7 +1876,9 @@ class GeoCalibApp(QMainWindow):
     def process_toa(self):
         """Process TOA from calibration files"""
         if not self.toa_files:
-            QMessageBox.warning(self, "Error", "No files selected")
+            msg = "No files selected"
+            print(f"Error: {msg}")
+            QMessageBox.warning(self, "Error", msg)
             return
         
         self.temperature = self.temp_spin.value()
@@ -1885,6 +1949,10 @@ class GeoCalibApp(QMainWindow):
         if result == QDialog.Accepted:
             min_dist, max_dist = dialog.get_selected_range()
             self.statusBar().showMessage(f"GCC validated: {filename} ({min_dist:.2f}-{max_dist:.2f}m)")
+            
+            # Pass validated TOAs back to thread
+            if self.processing_thread is not None:
+                self.processing_thread.validated_toa_map = dialog.toas
         
         # Signal processing thread to continue (unblock it)
         if self.processing_thread is not None:
@@ -2016,16 +2084,21 @@ class GeoCalibApp(QMainWindow):
         """Handle processing error"""
         self.statusBar().showMessage("Error during processing")
         QMessageBox.critical(self, "Processing Error", error_msg)
+        print(f"Processing Error: {error_msg}")
     
     # ==================== Geometry Inference ====================
     def run_solver(self):
         """Run the rcbox RMDU solver"""
         if self.toa_matrix is None:
-            QMessageBox.warning(self, "Error", "No TOA matrix available. Complete TOA validation first.")
+            msg = "No TOA matrix available. Complete TOA validation first."
+            print(f"Error: {msg}")
+            QMessageBox.warning(self, "Error", msg)
             return
         
         if not RCBOX_AVAILABLE:
-            QMessageBox.critical(self, "Error", "rcbox package not available. Install it first.")
+            msg = "rcbox package not available. Install it first."
+            print(f"Error: {msg}")
+            QMessageBox.critical(self, "Error", msg)
             return
         
         self.temperature = self.temp_spin.value()
@@ -2125,7 +2198,8 @@ class GeoCalibApp(QMainWindow):
                     
                     if antenna_max_dim == 0: antenna_max_dim = 1.0
                     
-                    scatter_sources = gl.GLScatterPlotItem(pos=sources_xyz, color=(0, 1, 0, 1), size=0.05 * antenna_max_dim, pxMode=False)
+                    # Sources in Grey
+                    scatter_sources = gl.GLScatterPlotItem(pos=sources_xyz, color=(0.5, 0.5, 0.5, 1), size=0.05 * antenna_max_dim, pxMode=False)
                     self.view_3d.addItem(scatter_sources)
                     
                     # Plot Microphones (remaining points) - Color by index
@@ -2209,7 +2283,9 @@ class GeoCalibApp(QMainWindow):
                 QMessageBox.information(self, "Success", f"TOA matrix saved successfully.\n\nShape: {self.toa_matrix.shape}")
                 
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to save TOA matrix:\n{str(e)}")
+                msg = f"Failed to save TOA matrix: {str(e)}"
+                print(msg)
+                QMessageBox.critical(self, "Error", msg)
     
     def load_toa_matrix(self):
         """Load a previously saved TOA matrix"""
@@ -2396,26 +2472,12 @@ class GeoCalibApp(QMainWindow):
     
     # ==================== Alignment ====================
     def enter_reference_positions(self):
-        """Enter reference microphone positions"""
+        """Enter reference microphone positions and indices"""
         num_ref = self.num_ref_spin.value()
         dialog = AlignmentDialog(self, num_ref_mics=num_ref)
         if dialog.exec_() == QDialog.Accepted:
-            self.ref_positions = dialog.get_positions()
-            self.align_status.setText(f"Ref positions entered: {num_ref} mics")
-    
-    def select_microphone_indices(self):
-        """Select microphone indices corresponding to reference positions"""
-        if self.toa_matrix is None:
-            QMessageBox.warning(self, "Error", "No TOA matrix available")
-            return
-        
-        num_ref = self.num_ref_spin.value()
-        total_mics = self.toa_matrix.shape[1]
-        
-        dialog = MicrophonePositionDialog(self, total_mics, num_ref)
-        if dialog.exec_() == QDialog.Accepted:
-            self.mic_indices = dialog.get_indices()
-            self.align_status.setText(f"Mic indices selected: {self.mic_indices}")
+            self.mic_indices, self.ref_positions = dialog.get_data()
+            self.align_status.setText(f"Reference data entered: {num_ref} mics")
     
     def perform_alignment(self):
         """Perform alignment using reference microphone positions"""
@@ -2424,10 +2486,14 @@ class GeoCalibApp(QMainWindow):
             return
         
         if self.ref_positions is None or self.mic_indices is None:
-            QMessageBox.warning(self, "Error", "Please enter reference positions and select microphone indices")
+            QMessageBox.warning(self, "Error", "Please enter reference positions and indices first")
             return
         
         try:
+            # Check if indices are valid
+            if self.xyz_final.shape[0] <= np.max(self.mic_indices):
+                raise ValueError(f"Microphone index {np.max(self.mic_indices)} out of bounds for geometry (size {self.xyz_final.shape[0]})")
+
             # Extract measured microphone positions
             measured_mics = self.xyz_final[self.mic_indices, :]
             
@@ -2442,7 +2508,33 @@ class GeoCalibApp(QMainWindow):
             self.alignment_translation = self.ref_positions.mean(axis=0) - measured_mics.mean(axis=0)
             
             # Apply alignment to all geometries
-            self.xyz_final = np.dot(self.xyz_final - self.xyz_final.mean(axis=0), rotation) + self.ref_positions.mean(axis=0)
+            # Use centroid alignment logic properly:
+            # 1. Center measured data
+            # 2. Rotate to align with centered reference
+            # 3. Translate to reference centroid
+            
+            # Centroid of measured original
+            centroid_measured = self.xyz_final.mean(axis=0) 
+            # Note: alignment calculates rotation based on subset of mics. 
+            # We want to apply transform T s.t. T(measured_subset) ~ reference_subset
+            
+            # Ref: https://en.wikipedia.org/wiki/Procrustes_analysis
+            # The rotation matrix R minimizes || (measured_subset - centroid_measured) * R - (reference_subset - centroid_reference) ||
+            # Wait, procrustes function signature matters.
+            # GeoCalibUtils.procrustes(data1, data2) usually aligns data1 TO data2.
+            
+            # Let's trust the previous implementation but refine the full transform application
+            # Previous: self.xyz_final = np.dot(self.xyz_final - self.xyz_final.mean(axis=0), rotation) + self.ref_positions.mean(axis=0)
+            
+            # The rotation was computed based on centered subsets.
+            # If we center the WHOLE measured array, it might not be the same centroid as the subset.
+            # Correct approach:
+            # T(x) = (x - measured_subset_centroid) * R + ref_subset_centroid
+            
+            measured_subset_centroid = measured_mics.mean(axis=0)
+            ref_subset_centroid = self.ref_positions.mean(axis=0)
+            
+            self.xyz_final = np.dot(self.xyz_final - measured_subset_centroid, rotation) + ref_subset_centroid
             
             self.align_status.setText("Alignment successful")
             self.statusBar().showMessage("Antenna alignment completed")
@@ -2450,6 +2542,9 @@ class GeoCalibApp(QMainWindow):
             
             # Update visualization
             self.plot_final_geometry()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Alignment Error", f"Alignment failed: {str(e)}")
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Alignment failed: {str(e)}")
@@ -2519,10 +2614,10 @@ class GeoCalibApp(QMainWindow):
         if antenna_max_dim == 0: antenna_max_dim = 1.0
              
         if Ns > 0 and xyz.shape[0] > Ns:
-             # Plot Sources (Green, Large) - Using ScatterPlot for stability
+             # Plot Sources (Grey, Large) - Using ScatterPlot for stability
              scatter_sources = gl.GLScatterPlotItem(
                  pos=sources, 
-                 color=(0, 1, 0, 1), 
+                 color=(0.5, 0.5, 0.5, 1), 
                  size=0.05 * antenna_max_dim, 
                  pxMode=False
              )
@@ -2632,7 +2727,7 @@ class GeoCalibApp(QMainWindow):
 
             scatter_sources = gl.GLScatterPlotItem(
                 pos=sources_xyz,
-                color=(0, 1, 0, 1),
+                color=(0.5, 0.5, 0.5, 1),
                 size=0.05 * antenna_max_dim,
                 pxMode=False
             )
