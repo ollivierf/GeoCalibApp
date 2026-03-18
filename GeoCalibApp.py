@@ -816,12 +816,13 @@ class SolverThread(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, toa_matrix, initial_xyz=None, lambda_param=0.050, 
-                 max_iter=10000, eps_limit=1e-10, temp_celsius=26, align_8=False):
+                 max_iter=10000, eps_limit=1e-10, temp_celsius=26, align_8=False, ndim=3):
         super().__init__()
         # Input: TOA matrix with shape (NbFiles, NbMics) or (NbMics, NbMics) if 2D
         # TOA values are in seconds, need to be converted to distances via multiplication by C
         
         self.align_8 = align_8
+        self.ndim = ndim
         self.toa_matrix = toa_matrix  # Store original for reference
         
         # Handle both 2D (single file) and 3D (multiple files) TOA arrays
@@ -879,7 +880,7 @@ class SolverThread(QThread):
             Wflat = squareform(W_full)
             
             # 2. Solver Parameters
-            Ndim = 3
+            Ndim = self.ndim
             Maxit = self.max_iter
             lbda = self.lambda_param
             
@@ -889,11 +890,22 @@ class SolverThread(QThread):
             if self.initial_xyz is None:
                 X[0, :, :] = np.random.randn(Ndim, Nr)
             else:
-                # If loaded geometry matches dimensions
-                if self.initial_xyz.shape == (3, Nr):
-                    X[0, :, :] = self.initial_xyz
-                elif self.initial_xyz.shape == (Nr, 3):
-                    X[0, :, :] = self.initial_xyz.T
+                # Handle potentially different dimension initialization
+                # Transpose if necessary to get (dim, Nr)
+                if self.initial_xyz.shape[1] == Nr:
+                    init_geom = self.initial_xyz
+                elif self.initial_xyz.shape[0] == Nr:
+                    init_geom = self.initial_xyz.T
+                else:
+                    init_geom = None
+                
+                if init_geom is not None:
+                    k_dim = init_geom.shape[0]
+                    if k_dim >= Ndim:
+                        X[0, :, :] = init_geom[:Ndim, :]
+                    else:
+                        X[0, :k_dim, :] = init_geom
+                        X[0, k_dim:, :] = np.random.randn(Ndim-k_dim, Nr)
                 else:
                     X[0, :, :] = np.random.randn(Ndim, Nr)
 
@@ -1656,6 +1668,11 @@ class GeoCalibApp(QMainWindow):
         self.eps_spin.setRange(1, 20)
         self.eps_spin.setValue(12)
         param_layout.addRow("Epsilon Limit (1e-N):", self.eps_spin)
+        
+        self.ndim_combo = QComboBox()
+        self.ndim_combo.addItems(["1", "2", "3"])
+        self.ndim_combo.setCurrentIndex(2) # Default 3
+        param_layout.addRow("Dimension (Ndim):", self.ndim_combo)
 
         self.align8_check = QCheckBox("Alignement par 8")
         self.align8_check.setChecked(False)
@@ -2198,7 +2215,8 @@ class GeoCalibApp(QMainWindow):
             max_iter=self.max_iter_spin.value(),
             eps_limit=10**(-self.eps_spin.value()),
             temp_celsius=self.temperature,
-            align_8=self.align8_check.isChecked()
+            align_8=self.align8_check.isChecked(),
+            ndim=int(self.ndim_combo.currentText())
         )
         self.solver_thread.progress.connect(self.solver_progress.setValue)
         self.solver_thread.status.connect(self.solver_status.setText)
@@ -2245,6 +2263,12 @@ class GeoCalibApp(QMainWindow):
             
             if xyz is None or xyz.shape[0] == 0:
                 return
+
+            # Ensure xyz is 3D for visualization (pad with zeros if Ndim < 3)
+            if xyz.shape[1] < 3:
+                new_xyz = np.zeros((xyz.shape[0], 3))
+                new_xyz[:, :xyz.shape[1]] = xyz
+                xyz = new_xyz
 
             # Determine Ns (number of sources)
             Ns = getattr(self, 'solver_Ns', 0)
@@ -2688,20 +2712,31 @@ class GeoCalibApp(QMainWindow):
             
         target_str = self.axis_combo.currentText()
         
-        # Determine number of sources
+        # Determine number of sources (Ns) or Mics (Nm) to identify mic subset
+        # Structure of xyz_final is [Sources... , Mics...]
+        Ns = 0
+        Nm = 0
+        total_points = self.xyz_final.shape[0]
+        
+        # Prefer using Nm (Columns of TOA matrix) to identify last rows
+        if self.toa_matrix is not None and self.toa_matrix.ndim == 2:
+            Nm = self.toa_matrix.shape[1] # Number of microphones
+            
+        # Fallback/Cross-check with solver Ns
         if hasattr(self, 'num_sources_solver') and self.num_sources_solver > 0:
             Ns = self.num_sources_solver
-        elif self.toa_matrix is not None:
-            Ns = self.toa_matrix.shape[0] if self.toa_matrix.ndim > 1 else 0
-        else:
-            # Fallback: use all points if Ns unknown
-            Ns = 0
-            
-        # Select microphone coordinates (indices Ns to end)
-        if Ns < self.xyz_final.shape[0]:
+            if Nm == 0 and Ns < total_points:
+                Nm = total_points - Ns
+        
+        # Select microphone coordinates (Last Nm rows)
+        if Nm > 0 and Nm < total_points:
+            mics_xyz = self.xyz_final[-Nm:, :]
+        elif Ns > 0 and Ns < total_points:
             mics_xyz = self.xyz_final[Ns:, :]
         else:
+            # Fallback: use all points if split unknown
             mics_xyz = self.xyz_final
+            print("Warning: Aligning using ALL points (Sources/Mics distinction unclear)")
         
         # Center the microphones
         centroid_mics = np.mean(mics_xyz, axis=0)
@@ -2839,7 +2874,7 @@ class GeoCalibApp(QMainWindow):
             self.animation_timer.stop()
     
     def save_animation(self):
-        """Save animation to video file"""
+        """Save animation to video file or HTML (Three.js)"""
         if self.xyz_iters is None:
             QMessageBox.warning(self, "Error", "No animation data available")
             return
@@ -2848,54 +2883,297 @@ class GeoCalibApp(QMainWindow):
             self,
             "Save Animation",
             "",
-            "MP4 Files (*.mp4);;AVI Files (*.avi)"
+            "HTML Files (*.html);;MP4 Files (*.mp4);;AVI Files (*.avi)"
         )
         
         if file_path:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == '.html':
+                self._save_animation_html(file_path)
+            else:
+                self._save_animation_video(file_path)
+
+    def _save_animation_html(self, file_path):
+        """Export animation to a standalone HTML file using Three.js"""
+        try:
+            import json
+            
+            # Determine Ns (Sources)
+            Ns = getattr(self, 'solver_Ns', 0)
+            if Ns == 0 and self.toa_matrix is not None:
+                if self.toa_matrix.ndim == 2:
+                    Ns = self.toa_matrix.shape[0]
+
+            # Prepare data
+            # xyz_iters shape: (Frames, Points, 3)
+            frames_data = self.xyz_iters.tolist()
+            
+            # Calculate bounds for camera positioning
+            all_points = self.xyz_iters.reshape(-1, 3)
+            max_range = np.max(np.abs(all_points)) * 1.5
+            
+            html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>GeoCalib Animation</title>
+    <style>
+        body {{ margin: 0; overflow: hidden; background-color: #000; color: #fff; font-family: sans-serif; }}
+        #hud {{ position: absolute; z-index: 100; pointer-events: none; width: 100%; height: 100%; }}
+        #info {{ position: absolute; top: 10px; width: 100%; text-align: center; font-size: 1.2em; text-shadow: 1px 1px 2px black; }}
+        #controls {{ position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%); 
+                     background: rgba(0,0,0,0.5); padding: 10px; border-radius: 8px; pointer-events: auto; display: flex; gap: 10px; align-items: center; }}
+        button {{ background: #444; color: #fff; border: 1px solid #666; padding: 5px 15px; cursor: pointer; border-radius: 4px; }}
+        button:hover {{ background: #666; }}
+        input[type=range] {{ width: 300px; cursor: pointer; }}
+        .label {{ font-size: 0.9em; min-width: 80px; text-align: right; }}
+    </style>
+    <!-- Three.js from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+    <div id="hud">
+        <div id="info">
+            GeoCalib Optimization Animation<br>
+            <span style="font-size: 0.8em; color: #aaa;">Left Click: Rotate | Right Click: Pan | Scroll: Zoom</span>
+        </div>
+        <div id="controls">
+            <button id="btn-play">Pause</button>
+            <input type="range" id="scrubber" min="0" max="100" value="0">
+            <span id="frame-count" class="label">Frame: 0</span>
+        </div>
+    </div>
+
+    <script>
+        // DATA INJECTION
+        const frames = {json.dumps(frames_data)};
+        const numSources = {Ns};
+        const numPoints = frames[0].length;
+        const totalFrames = frames.length;
+        const maxRange = {max_range};
+
+        // SCENE SETUP
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x111111);
+        scene.fog = new THREE.Fog(0x111111, maxRange * 2, maxRange * 5);
+        
+        // GRID
+        const gridHelper = new THREE.GridHelper(maxRange * 2, 20, 0x444444, 0x222222);
+        scene.add(gridHelper);
+        
+        // AXES
+        const axesHelper = new THREE.AxesHelper(maxRange * 0.2);
+        scene.add(axesHelper);
+
+        // LIGHTS
+        const ambientLight = new THREE.AmbientLight(0x404040);
+        scene.add(ambientLight);
+        const pointLight = new THREE.PointLight(0xffffff, 1, 0);
+        pointLight.position.set(maxRange, maxRange, maxRange);
+        scene.add(pointLight);
+
+        // CAMERA
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 1000);
+        camera.position.set(maxRange*0.8, maxRange*0.5, maxRange*0.8);
+        camera.lookAt(0, 0, 0);
+
+        // RENDERER
+        const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+
+        // CONTROLS
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+
+        // GEOMETRY (POINTS)
+        // We use Points material for performance
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(numPoints * 3);
+        const colors = new Float32Array(numPoints * 3);
+        const sizes = new Float32Array(numPoints);
+        
+        // Compute colors once (static)
+        for (let i = 0; i < numPoints; i++) {{
+            const color = new THREE.Color();
+            if (i < numSources) {{
+                // Sources: Green/White (High visibility)
+                color.setHex(0x00ff00);
+                sizes[i] = maxRange * 0.03; 
+            }} else {{
+                // Mics: Spectrum based on index
+                // const hue = (i - numSources) / Math.max(1, numPoints - numSources - 1);
+                // Cycle hues to distinguish adjacent mics better
+                const hue = ((i - numSources) * 0.1) % 1.0; 
+                color.setHSL(hue, 0.8, 0.5);
+                sizes[i] = maxRange * 0.015;
+            }}
+            colors[i*3] = color.r;
+            colors[i*3+1] = color.g;
+            colors[i*3+2] = color.b;
+        }}
+
+        // Set initial positions
+        const f0 = frames[0];
+        for (let i = 0; i < numPoints; i++) {{
+            positions[i*3] = f0[i][0];
+            positions[i*3+1] = f0[i][1];
+            positions[i*3+2] = f0[i][2];
+        }}
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        // Note: standard PointsMaterial doesn't support per-vertex sizing easily without shaders,
+        // so we start with uniform size.
+        
+        const material = new THREE.PointsMaterial({{ 
+            size: maxRange * 0.02, 
+            vertexColors: true,
+            sizeAttenuation: true 
+        }});
+        
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+        
+        // Add larger markers for Sources manual fix (since we can't do variable size easily in one draw call)
+        // Actually for simplicity, let's keep it uniform size but distinct color.
+
+        // ANIMATION STATE
+        let currentFrame = 0;
+        let isPlaying = true;
+        let lastTime = 0;
+        const fps = 30;
+        const interval = 1000 / fps;
+
+        // UI ELEMENTS
+        const frameLabel = document.getElementById('frame-count');
+        const playBtn = document.getElementById('btn-play');
+        const scrubber = document.getElementById('scrubber');
+        scrubber.max = totalFrames - 1;
+
+        // PLAY/PAUSE
+        function togglePlay() {{
+            isPlaying = !isPlaying;
+            playBtn.textContent = isPlaying ? "Pause" : "Play";
+        }}
+        playBtn.addEventListener('click', togglePlay);
+
+        // SCRUBBER
+        scrubber.addEventListener('input', (e) => {{
+            isPlaying = false;
+            playBtn.textContent = "Play";
+            currentFrame = parseInt(e.target.value);
+            updatePoints(currentFrame);
+        }});
+
+        function updatePoints(frameIdx) {{
+            if (frameIdx >= totalFrames) frameIdx = totalFrames - 1;
+            const frame = frames[frameIdx];
+            const posAttr = geometry.attributes.position;
+            
+            for (let i = 0; i < numPoints; i++) {{
+                posAttr.setXYZ(i, frame[i][0], frame[i][1], frame[i][2]);
+            }}
+            posAttr.needsUpdate = true;
+            
+            frameLabel.textContent = "Frame: " + frameIdx + " / " + (totalFrames - 1);
+            scrubber.value = frameIdx;
+        }}
+
+        function animate(time) {{
+            requestAnimationFrame(animate);
+            controls.update();
+
+            if (isPlaying && (time - lastTime > interval)) {{
+                lastTime = time;
+                currentFrame++;
+                if (currentFrame >= totalFrames) {{
+                     // currentFrame = 0; // Loop
+                     currentFrame = totalFrames - 1;
+                     isPlaying = false;
+                     playBtn.textContent = "Play";
+                }}
+                updatePoints(currentFrame);
+            }}
+
+            renderer.render(scene, camera);
+        }}
+
+        // RESIZE HANDLER
+        window.addEventListener('resize', () => {{
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }});
+
+        updatePoints(0);
+        animate(0);
+    </script>
+</body>
+</html>"""
+
             try:
-                self.statusBar().showMessage("Saving animation...")
-                from matplotlib.animation import FuncAnimation, FFMpegWriter
-                # import matplotlib.pyplot as plt # Already imported at module level
-                from mpl_toolkits.mplot3d import Axes3D
-                
-                L = np.max(np.abs(self.xyz_iters))
-                
-                fig = plt.figure(facecolor='black')
-                ax = fig.add_subplot(111, projection='3d', facecolor='black')
-                ax.set_xlim([-L, L])
-                ax.set_ylim([-L, L])
-                ax.set_zlim([-L, L])
-                ax.set_xlabel('X', color='white')
-                ax.set_ylabel('Y', color='white')
-                ax.set_zlabel('Z', color='white')
-                ax.tick_params(colors='white')
-                
-                scatter = ax.scatter([], [], [], c='r', s=20)
-                
-                def update(frame):
-                    scatter._offsets3d = (
-                        self.xyz_iters[frame, :, 0],
-                        self.xyz_iters[frame, :, 1],
-                        self.xyz_iters[frame, :, 2]
-                    )
-                    return scatter,
-                
-                ani = FuncAnimation(fig, update, frames=len(self.xyz_iters), interval=50, blit=False)
-                
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext == '.mp4':
-                    writer = FFMpegWriter(fps=20, metadata=dict(artist='GeoCalib'), bitrate=1800)
-                else:
-                    writer = FFMpegWriter(fps=20, metadata=dict(artist='GeoCalib'), bitrate=1800)
-                
-                ani.save(file_path, writer=writer)
-                plt.close(fig)
-                
-                self.statusBar().showMessage(f"Animation saved to {file_path}")
-                QMessageBox.information(self, "Success", f"Animation saved to:\n{file_path}")
-                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                self.statusBar().showMessage(f"HTML Animation saved to {file_path}")
+                QMessageBox.information(self, "Success", f"HTML Animation saved successfully to:\n{file_path}\n\nOpen this file in a modern web browser.")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to save animation:\n{str(e)}")
+                # If encoding fails or other write error
+                QMessageBox.critical(self, "Error", f"Failed to write file: {e}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export HTML:\n{str(e)}")
+
+    def _save_animation_video(self, file_path):
+        """Internal helper to save video using Matplotlib"""
+        try:
+            self.statusBar().showMessage("Saving animation...")
+            from matplotlib.animation import FuncAnimation, FFMpegWriter
+            # import matplotlib.pyplot as plt # Already imported at module level
+            from mpl_toolkits.mplot3d import Axes3D
+            
+            L = np.max(np.abs(self.xyz_iters))
+            
+            fig = plt.figure(facecolor='black')
+            ax = fig.add_subplot(111, projection='3d', facecolor='black')
+            ax.set_xlim([-L, L])
+            ax.set_ylim([-L, L])
+            ax.set_zlim([-L, L])
+            ax.set_xlabel('X', color='white')
+            ax.set_ylabel('Y', color='white')
+            ax.set_zlabel('Z', color='white')
+            ax.tick_params(colors='white')
+            
+            scatter = ax.scatter([], [], [], c='r', s=20)
+            
+            def update(frame):
+                scatter._offsets3d = (
+                    self.xyz_iters[frame, :, 0],
+                    self.xyz_iters[frame, :, 1],
+                    self.xyz_iters[frame, :, 2]
+                )
+                return scatter,
+            
+            ani = FuncAnimation(fig, update, frames=len(self.xyz_iters), interval=50, blit=False)
+            
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == '.mp4':
+                # Use libx264 codec and yuv420p pixel format for broad compatibility (QuickTime, Windows Media Player)
+                writer = FFMpegWriter(fps=20, codec='libx264', metadata=dict(artist='GeoCalib'), bitrate=1800, extra_args=['-pix_fmt', 'yuv420p'])
+            else:
+                writer = FFMpegWriter(fps=20, metadata=dict(artist='GeoCalib'), bitrate=1800)
+            
+            ani.save(file_path, writer=writer)
+            plt.close(fig)
+            
+            self.statusBar().showMessage(f"Animation saved to {file_path}")
+            QMessageBox.information(self, "Success", f"Animation saved to:\n{file_path}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save animation:\n{str(e)}")
     
     # ==================== Data Export ====================
     def save_xyz_results(self):
