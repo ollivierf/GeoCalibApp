@@ -34,23 +34,22 @@ VERSION: 1.0
 LAST UPDATED: 2025-12-18
 """
 
-import sys, os, json, hashlib, pickle, threading
+import sys, os, json, threading, warnings
 import numpy as np
-from datetime import datetime
-from pathlib import Path
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-    QPushButton, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QFileDialog, QTabWidget, 
-    QTableWidget, QTableWidgetItem, QComboBox, QProgressBar, QGroupBox, QFormLayout, 
-    QCheckBox, QMessageBox, QListWidget, QListWidgetItem, QDialog, QSlider, QStatusBar,
-    QScrollArea)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QColor, QFont
-import pyqtgraph as pg
-import pyqtgraph.opengl as gl
 import h5py
 import scipy.signal as sig
-import warnings
-import matplotlib as plt
+from datetime import datetime
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QPushButton, QLabel, QSpinBox, QDoubleSpinBox, QFileDialog, 
+    QTableWidget, QTableWidgetItem, QComboBox, QProgressBar, QGroupBox, QFormLayout, 
+    QCheckBox, QMessageBox, QListWidget, QListWidgetItem, QDialog, QSlider, QScrollArea, QToolTip)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont, QVector3D, QVector4D, QCursor
+import pyqtgraph as pg
+import pyqtgraph.opengl as gl
+import matplotlib.pyplot as plt
+
+# Optional dependencies
 try:
     from rcbox.rmds import RMDU, _Lmake, compute_Lpinv, _Slambda
     from rcbox import toa_processor
@@ -68,8 +67,67 @@ try:
 except ImportError:
     DATPARSER_AVAILABLE = False
 
-from GeoCalibUtils import procrustes, evalDTOA
+from GeoCalibUtils import procrustes
+
 warnings.filterwarnings("ignore")
+
+class ClickableGLViewWidget(gl.GLViewWidget):
+    """GLViewWidget with click support for scatter points"""
+    point_clicked = pyqtSignal(str)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        if event.buttons() & Qt.LeftButton:
+            self.pick_item(event.pos())
+
+    def pick_item(self, pos):
+        # Camera matrices
+        view_matrix = self.viewMatrix()
+        
+        w = self.width()
+        h = self.height()
+        region = (0, 0, w, h)
+        proj_matrix = self.projectionMatrix(region, region)
+        mvp = proj_matrix * view_matrix
+        
+        click_x = pos.x()
+        click_y = pos.y()
+        
+        min_dist = 20 # pixels threshold
+        candidates = []
+        
+        for item in self.items:
+            if isinstance(item, gl.GLScatterPlotItem):
+                tag = getattr(item, 'tag', None)
+                if not tag: continue
+                
+                points = item.pos
+                if points is None: continue
+                
+                for i, pt in enumerate(points):
+                    vec = QVector3D(pt[0], pt[1], pt[2])
+                    pt_h = QVector4D(vec, 1.0)
+                    screen_vec = mvp * pt_h
+                    
+                    w_coord = screen_vec.w()
+                    if w_coord <= 0: continue
+                    
+                    x_ndc = screen_vec.x() / w_coord
+                    y_ndc = screen_vec.y() / w_coord
+                    
+                    sx = (x_ndc + 1) * 0.5 * w
+                    sy = (1 - y_ndc) * 0.5 * h 
+                    
+                    dist = ((sx - click_x)**2 + (sy - click_y)**2)**0.5
+                    
+                    if dist < min_dist:
+                        candidates.append((dist, tag, i))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            best = candidates[0]
+            self.point_clicked.emit(f"{best[1]}_{best[2]}")
+
 
 class GCCValidationDialog(QDialog):
     """\n    Interactive dialog for validating and selecting Time-of-Arrival (TOA) range from GCC-PHAT.
@@ -736,34 +794,6 @@ class ProcessingThread(QThread):
                 self.gcc_validated_range = (0.0, 10.0)
             
             return toas
-    
-    def _compute_dtoa(self, toas, ref_mic_idx=0):
-        """Compute Differential TOA (DTOA) matrix from TOA measurements.
-        
-        DTOA[i,j] = TOA[i] - TOA[j] for all microphone pairs (no reference channel)
-        
-        Parameters:
-            toas: (NbMics,) array of TOA values for all mics
-            ref_mic_idx: Index of reference microphone (not used for matrix form)
-        
-        Returns:
-            dtoa_matrix: (NbMics, NbMics) 2D differential TOA matrix
-                        Properties:
-                        - Diagonal = 0 (mic i vs itself)
-                        - Antisymmetric: dtoa[i,j] = -dtoa[j,i]
-        
-        Note: Each data file produces one such matrix.
-              Multiple files assembled into (NbMics, NbMics, NbDatafiles) 3D array.
-        """
-        if len(toas) == 0:
-            return np.array([])
-        
-        # Create 2D matrix: dtoa[i,j] = toa[i] - toa[j]
-        toas_col = toas.reshape(-1, 1)  # Shape: (M, 1)
-        toas_row = toas.reshape(1, -1)  # Shape: (1, M)
-        dtoa_matrix = toas_col - toas_row  # Broadcasting creates (M, M)
-        
-        return dtoa_matrix
 
 
 class SolverThread(QThread):
@@ -1575,9 +1605,9 @@ class GeoCalibApp(QMainWindow):
         save_toa_btn.setToolTip("Save the validated TOA matrix for later use")
         toa_io_layout.addWidget(save_toa_btn)
         
-        load_toa_btn = QPushButton("Load Validated TOA")
+        load_toa_btn = QPushButton("Load and validate TOA matrix")
         load_toa_btn.clicked.connect(self.load_toa_matrix)
-        load_toa_btn.setToolTip("Load a previously saved TOA matrix")
+        load_toa_btn.setToolTip("Load a previously saved TOA matrix and validate it")
         toa_io_layout.addWidget(load_toa_btn)
         
         layout.addLayout(toa_io_layout)
@@ -1682,6 +1712,13 @@ class GeoCalibApp(QMainWindow):
         self.num_ref_spin.setMinimum(3)
         self.num_ref_spin.setMaximum(16)
         num_layout.addRow("Number of Ref Mics:", self.num_ref_spin)
+        
+        # Principal axis selection
+        self.axis_combo = QComboBox()
+        self.axis_combo.addItems(["+x", "-x", "+z", "-z"])
+        self.axis_combo.currentIndexChanged.connect(self.align_geometry_to_principal_axis)
+        num_layout.addRow("Principal Direction:", self.axis_combo)
+        
         layout.addLayout(num_layout)
         
         # Buttons
@@ -1738,6 +1775,13 @@ class GeoCalibApp(QMainWindow):
         
         layout.addLayout(plot_layout)
         
+        # Source highlighting
+        layout.addWidget(QLabel("Highlight Sources (Checked = White):"))
+        self.source_list = QListWidget()
+        self.source_list.setFixedHeight(150) # Limit height
+        self.source_list.itemChanged.connect(self.on_source_highlight_changed)
+        layout.addWidget(self.source_list)
+        
         # Animation controls
         layout.addWidget(QLabel("Iteration Animation:"))
         
@@ -1790,7 +1834,8 @@ class GeoCalibApp(QMainWindow):
         layout = QVBoxLayout()
         
         # 3D OpenGL view
-        self.view_3d = gl.GLViewWidget()
+        self.view_3d = ClickableGLViewWidget()
+        self.view_3d.point_clicked.connect(self.on_3d_point_clicked)
         self.view_3d.opts['distance'] = 5
         
         # Add grid
@@ -1813,6 +1858,11 @@ class GeoCalibApp(QMainWindow):
         
         group.setLayout(layout)
         return group
+
+    def on_3d_point_clicked(self, label):
+        """Handle click on 3D point"""
+        QToolTip.showText(QCursor.pos(), label)
+        self.statusBar().showMessage(f"Selected: {label}")
     
     def reset_3d_view(self):
         """Reset 3D view to have XY plane horizontal and Z vertical"""
@@ -1822,6 +1872,34 @@ class GeoCalibApp(QMainWindow):
         # However, "Z axis vertical" usually implies a perspective view from side.
         # Let's use a standard isometric-style view where Z is up.
         self.view_3d.setCameraPosition(elevation=30, azimuth=45)
+        
+    def populate_source_list(self):
+        """Populate source list with checkboxes based on available sources"""
+        self.source_list.blockSignals(True)
+        self.source_list.clear()
+        
+        # Determine sources from toa_matrix or selected_filenames
+        sources = []
+        if self.selected_toa_filenames:
+            sources = [os.path.basename(f) for f in self.selected_toa_filenames]
+        elif self.toa_matrix is not None:
+            # If loaded matrix without filenames, use numbering
+            num_sources = self.toa_matrix.shape[0]
+            sources = [f"Source {i+1}" for i in range(num_sources)]
+            
+        for source_name in sources:
+            item = QListWidgetItem(source_name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.source_list.addItem(item)
+            
+        self.source_list.blockSignals(False)
+
+    def on_source_highlight_changed(self, item=None):
+        """Update 3D plot to highlight selected sources"""
+        # Re-plot the final geometry which will read the check states
+        if self.xyz_final is not None:
+            self.plot_final_geometry()
     
     # ==================== TOA Processing ====================
     def browse_toa_files(self):
@@ -2073,6 +2151,9 @@ class GeoCalibApp(QMainWindow):
             
             # Store DTOA for reference only (visualization/diagnostics)
             self.dtoa_matrices = selected_dtoas
+
+            # Populate source list
+            self.populate_source_list()
             
             msg = f"Using {len(selected_dtoas)}/{len(filenames)} sources. TOA matrix shape: {self.toa_matrix.shape}"
             self.toa_status.setText(msg)
@@ -2130,6 +2211,7 @@ class GeoCalibApp(QMainWindow):
         """Handle completed solver run"""
         self.xyz_iters = results['XYZ_iters']
         self.xyz_final = results['XYZ_final']
+        self.num_sources_solver = results.get('Ns', 0)
         
         msg = f"Solver finished: {len(self.xyz_iters)} iterations\n"
         if results['final_error']:
@@ -2149,13 +2231,8 @@ class GeoCalibApp(QMainWindow):
         QMessageBox.critical(self, "Solver Error", error_msg)
         print(f"Solver Error: {error_msg}")
     
-    def update_3d_visualization(self, xyz):
-        """Update 3D visualization with current iteration (thread-safe via signal)
-        
-        IMPORTANT: This slot is called from SolverThread via pyqtSignal emission.
-        Qt automatically marshals signal emissions to the main thread, ensuring
-        all Qt operations here are thread-safe and won't cause timer/parent errors.
-        """
+    def _update_3d_scene(self, xyz, highlight_refs=False):
+        """Helper to update 3D visualization with sources and microphones"""
         try:
             self.view_3d.clear()
             
@@ -2166,75 +2243,91 @@ class GeoCalibApp(QMainWindow):
             axis.setSize(1, 1, 1)
             self.view_3d.addItem(axis)
             
-            # Plot points
-            import matplotlib.pyplot as plt
-            if xyz.shape[0] > 0 and xyz.shape[1] == 3:
-                # Use TOA matrix shape to determine number of sources (Ns)
-                Ns = self.toa_matrix.shape[0] if self.toa_matrix is not None else 0
-                
-                if Ns > 0 and xyz.shape[0] > Ns:
-                    # Plot Sources (first Ns points) - Green, larger
-                    sources_xyz = xyz[:Ns]
-                    mics_xyz = xyz[Ns:]
+            if xyz is None or xyz.shape[0] == 0:
+                return
 
-                    # Calculate scaling based on TOA * C
-                    # C = sqrt(1.4 * 287 * T_Kelvin)
-                    temp_kelvin = self.temperature + 273.15
+            # Determine Ns (number of sources)
+            Ns = getattr(self, 'solver_Ns', 0)
+            if Ns == 0 and self.toa_matrix is not None:
+                if self.toa_matrix.ndim == 2:
+                    Ns = self.toa_matrix.shape[0]
+            
+            # Identify Sources vs Mics
+            sources = np.array([])
+            mics = xyz
+            if Ns > 0 and xyz.shape[0] > Ns:
+                sources = xyz[:Ns]
+                mics = xyz[Ns:]
+            
+            # Calculate scaling based on TOA * C for point sizes
+            antenna_max_dim = 1.0
+            if self.toa_matrix is not None:
+                valid_toas = self.toa_matrix[~np.isnan(self.toa_matrix)]
+                if valid_toas.size > 0:
+                    temp_kelvin = getattr(self, 'temperature', 20.0) + 273.15
                     c_sound = np.sqrt(1.4 * 287 * temp_kelvin)
-                    
-                    if self.toa_matrix is not None:
-                         # Calculate max DTOA range per source
-                         # ptp per source (axis 1 if shape is Ns, Nm)
-                         valid_toas = self.toa_matrix[~np.isnan(self.toa_matrix)]
-                         if valid_toas.size > 0:
-                             # Use overall max range as a safe upper bound
-                             # This is max dist - min dist found in data * C
-                             max_toa_range = np.ptp(valid_toas)
-                             antenna_max_dim = max_toa_range * c_sound
-                         else:
-                             antenna_max_dim = 1.0
-                    else:
-                        antenna_max_dim = 1.0
-                    
-                    if antenna_max_dim == 0: antenna_max_dim = 1.0
-                    
-                    # Sources in Grey
-                    scatter_sources = gl.GLScatterPlotItem(pos=sources_xyz, color=(0.5, 0.5, 0.5, 1), size=0.05 * antenna_max_dim, pxMode=False)
-                    self.view_3d.addItem(scatter_sources)
-                    
-                    # Plot Microphones (remaining points) - Color by index
-                    num_mics = mics_xyz.shape[0]
-                    color_values = np.arange(num_mics) / (num_mics - 1) if num_mics > 1 else np.array([0.5])
+                    antenna_max_dim = np.ptp(valid_toas) * c_sound
+            
+            if antenna_max_dim == 0: antenna_max_dim = 1.0
+            
+            # --- Plot Sources ---
+            if len(sources) > 0:
+                source_colors = np.tile([0.5, 0.5, 0.5, 1.0], (len(sources), 1))
+                
+                # Check for highlighted sources in list widget
+                if hasattr(self, 'source_list') and self.source_list.count() == len(sources):
+                    try:
+                        for i in range(len(sources)):
+                            if self.source_list.item(i).checkState() == Qt.Checked:
+                                source_colors[i] = [1.0, 1.0, 1.0, 1.0]
+                    except Exception:
+                        pass # visual only
+
+                scatter_sources = gl.GLScatterPlotItem(
+                    pos=sources, color=source_colors, 
+                    size=0.05 * antenna_max_dim, pxMode=False
+                )
+                scatter_sources.tag = 's'
+                self.view_3d.addItem(scatter_sources)
+            
+            # --- Plot Microphones ---
+            if len(mics) > 0:
+                num_mics = len(mics)
+                if num_mics > 1:
+                    color_values = np.arange(num_mics) / (num_mics - 1)
                     colors_rgba = plt.cm.hsv(color_values)
-                    
-                    scatter_mics = gl.GLScatterPlotItem(pos=mics_xyz, color=colors_rgba, size=0.025 * antenna_max_dim, pxMode=False)
-                    self.view_3d.addItem(scatter_mics)
                 else:
-                    # Fallback if dimensions unclear
-                    num_points = xyz.shape[0]
-                    color_values = np.arange(num_points) / (num_points - 1) if num_points > 1 else np.array([0.5])
-                    colors_rgba = plt.cm.hsv(color_values)
+                    colors_rgba = np.array([[1.0, 0.0, 0.0, 1.0]])
+                
+                scatter_mics = gl.GLScatterPlotItem(
+                    pos=mics, color=colors_rgba, 
+                    size=0.025 * antenna_max_dim, pxMode=False
+                )
+                scatter_mics.tag = 'm'
+                self.view_3d.addItem(scatter_mics)
+                
+                # Highlight Reference Microphones
+                if highlight_refs and getattr(self, 'mic_indices', None) is not None:
+                    ref_pos = []
+                    ref_cols = []
+                    for idx in self.mic_indices:
+                        if idx < len(mics):
+                            ref_pos.append(mics[idx])
+                            ref_cols.append(colors_rgba[idx])
                     
-                    # Calculate scaling based on TOA * C
-                    temp_kelvin = self.temperature + 273.15
-                    c_sound = np.sqrt(1.4 * 287 * temp_kelvin)
-                    
-                    if self.toa_matrix is not None:
-                         valid_toas = self.toa_matrix[~np.isnan(self.toa_matrix)]
-                         if valid_toas.size > 0:
-                             antenna_max_dim = np.ptp(valid_toas) * c_sound
-                         else:
-                             antenna_max_dim = 1.0
-                    else:
-                        antenna_max_dim = 1.0
+                    if ref_pos:
+                        scatter_refs = gl.GLScatterPlotItem(
+                            pos=np.array(ref_pos), color=np.array(ref_cols),
+                            size=15, pxMode=True # Fixed pixel size for visibility
+                        )
+                        self.view_3d.addItem(scatter_refs)
                         
-                    if antenna_max_dim == 0: antenna_max_dim = 1.0
-                    
-                    scatter = gl.GLScatterPlotItem(pos=xyz, color=colors_rgba, size=0.025 * antenna_max_dim, pxMode=False)
-                    self.view_3d.addItem(scatter)
         except Exception as e:
-            # Log error but don't propagate - visualization is non-critical
-            print(f"Warning: Error updating 3D visualization: {e}")
+            print(f"Error updating 3D scene: {e}")
+
+    def update_3d_visualization(self, xyz):
+        """Update 3D visualization with current iteration (thread-safe via signal)"""
+        self._update_3d_scene(xyz, highlight_refs=False)
     
     # ==================== TOA Matrix Save/Load ====================
     def save_toa_matrix(self):
@@ -2288,10 +2381,10 @@ class GeoCalibApp(QMainWindow):
                 QMessageBox.critical(self, "Error", msg)
     
     def load_toa_matrix(self):
-        """Load a previously saved TOA matrix"""
+        """Load a previously saved TOA matrix and validate it"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Load Validated TOA Matrix",
+            "Load TOA Matrix",
             "",
             "NumPy Compressed (*.npz);;NumPy Array (*.npy);;CSV Files (*.csv);;All Files (*)"
         )
@@ -2299,32 +2392,51 @@ class GeoCalibApp(QMainWindow):
         if file_path:
             try:
                 ext = os.path.splitext(file_path)[1].lower()
+                loaded_toas = None
+                filenames = []
                 
                 if ext == '.npz':
                     # Load from compressed numpy
                     data = np.load(file_path, allow_pickle=True)
-                    self.toa_matrix = data['toa_matrix']
+                    loaded_toas = data['toa_matrix']
                     # Try to load metadata
                     if 'metadata' in data:
                         metadata = data['metadata'].item()
                         if isinstance(metadata.get('selected_filenames'), list):
-                            self.selected_toa_filenames = metadata.get('selected_filenames', [])
+                            filenames = metadata.get('selected_filenames', [])
                         if metadata.get('temperature_celsius'):
                             self.temperature = metadata['temperature_celsius']
                             self.temp_spin.setValue(self.temperature)
                     
                 elif ext == '.npy':
                     # Load numpy array
-                    self.toa_matrix = np.load(file_path)
+                    loaded_toas = np.load(file_path)
                 else:
                     # Load CSV
-                    self.toa_matrix = np.loadtxt(file_path, delimiter=',')
+                    loaded_toas = np.loadtxt(file_path, delimiter=',')
                 
-                # Update status
-                msg = f"TOA matrix loaded: {self.toa_matrix.shape[0]} sources × {self.toa_matrix.shape[1]} mics"
-                self.toa_status.setText(msg)
-                self.statusBar().showMessage(msg)
-                QMessageBox.information(self, "Success", f"TOA matrix loaded successfully.\n\n{msg}")
+                if loaded_toas is None:
+                    return
+
+                # Ensure 2D array (sources x mics)
+                if loaded_toas.ndim == 1:
+                    loaded_toas = loaded_toas.reshape(1, -1)
+                
+                num_sources = loaded_toas.shape[0]
+                
+                # Generate generic filenames if missing or mismatched length
+                if not filenames or len(filenames) != num_sources:
+                    filenames = [f"Source_{i+1:03d}" for i in range(num_sources)]
+                
+                # Convert matrix rows to list of maps for processing workflow
+                # Each row is a TOA map for one source/file
+                toa_maps = list(loaded_toas)
+                
+                self.statusBar().showMessage(f"Loaded {num_sources} sources from file, starting validation...")
+                
+                # Trigger standard validation workflow (Step 1A -> 1B)
+                # This will open the TOAMapViewer, allow selection, and then validate DTOA
+                self.on_toa_processed(filenames, toa_maps)
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load TOA matrix:\n{str(e)}")
@@ -2365,6 +2477,10 @@ class GeoCalibApp(QMainWindow):
                 # Update status in Step 2
                 msg = f"Loaded: {self.toa_matrix.shape[0]} sources, {self.toa_matrix.shape[1]} mics"
                 self.loaded_toa_label.setText(msg)
+                
+                # Populate source list
+                self.populate_source_list()
+                
                 self.statusBar().showMessage(f"TOA matrix loaded for Step 2: {msg}")
                 
             except Exception as e:
@@ -2402,10 +2518,26 @@ class GeoCalibApp(QMainWindow):
                 
                 if ext == '.npz':
                     # Save as compressed numpy with metadata
+                    save_arrays = {
+                        'xyz_final': self.xyz_final,
+                        'metadata': metadata
+                    }
+                    
+                    # Split into XYZs and XYZm if TOA matrix information is available
+                    if self.toa_matrix is not None:
+                        try:
+                            # Result vector is concatenated [Sources; Mics]
+                            # Ns = self.toa_matrix.shape[0] (number of sources)
+                            Ns = self.toa_matrix.shape[0]
+                            if Ns < self.xyz_final.shape[0]:
+                                save_arrays['XYZs'] = self.xyz_final[:Ns]
+                                save_arrays['XYZm'] = self.xyz_final[Ns:]
+                        except Exception as e:
+                            print(f"Error splitting geometry: {e}")
+                            
                     np.savez_compressed(
                         file_path,
-                        xyz_final=self.xyz_final,
-                        metadata=metadata
+                        **save_arrays
                     )
                 elif ext == '.npy':
                     # Save just the matrix
@@ -2549,6 +2681,89 @@ class GeoCalibApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Alignment failed: {str(e)}")
     
+    def align_geometry_to_principal_axis(self):
+        """Rotate geometry so its principal axis aligns with selected direction"""
+        if self.xyz_final is None:
+            return
+            
+        target_str = self.axis_combo.currentText()
+        
+        # Determine number of sources
+        if hasattr(self, 'num_sources_solver') and self.num_sources_solver > 0:
+            Ns = self.num_sources_solver
+        elif self.toa_matrix is not None:
+            Ns = self.toa_matrix.shape[0] if self.toa_matrix.ndim > 1 else 0
+        else:
+            # Fallback: use all points if Ns unknown
+            Ns = 0
+            
+        # Select microphone coordinates (indices Ns to end)
+        if Ns < self.xyz_final.shape[0]:
+            mics_xyz = self.xyz_final[Ns:, :]
+        else:
+            mics_xyz = self.xyz_final
+        
+        # Center the microphones
+        centroid_mics = np.mean(mics_xyz, axis=0)
+        centered_mics = mics_xyz - centroid_mics
+        
+        # PCA via SVD on microphones only
+        try:
+            # SVD returns U, S, Vt
+            # Vt has eigenvectors as rows. First row is principal component.
+            u, s, vt = np.linalg.svd(centered_mics, full_matrices=False)
+            principal_axis = vt[0]
+            
+            # Define target vector
+            if target_str == "+x":
+                target_vec = np.array([1.0, 0.0, 0.0])
+            elif target_str == "-x":
+                target_vec = np.array([-1.0, 0.0, 0.0])
+            elif target_str == "+z":
+                target_vec = np.array([0.0, 0.0, 1.0])
+            else: # "-z"
+                target_vec = np.array([0.0, 0.0, -1.0])
+            
+            # Compute rotation matrix (Rodrigues formula)
+            a = principal_axis / np.linalg.norm(principal_axis)
+            b = target_vec # already unit
+            
+            v = np.cross(a, b)
+            s = np.linalg.norm(v)
+            c = np.dot(a, b)
+            
+            if s < 1e-6:
+                # Parallel or anti-parallel
+                if c > 0:
+                    rotation_matrix = np.eye(3)
+                else:
+                    # 180 degree rotation around arbitrary orthogonal axis
+                    if np.abs(a[0]) > 0.9:
+                        perp = np.array([0.0, 1.0, 0.0])
+                    else:
+                        perp = np.array([1.0, 0.0, 0.0])
+                    axis = np.cross(a, perp)
+                    axis = axis / np.linalg.norm(axis)
+                    rotation_matrix = 2 * np.outer(axis, axis) - np.eye(3)
+            else:
+                k = v # axis vector scaled by sin(theta)
+                # Skew symmetric cross product matrix of v
+                vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                # R = I + vx + vx^2 * (1-c)/s^2
+                rotation_matrix = np.eye(3) + vx + np.dot(vx, vx) * ((1 - c) / (s**2))
+            
+            # Apply rotation to ALL points (sources + mics) relative to MIC centroid
+            # P_new = (P_old - C_mics) * R^T + C_mics
+            self.xyz_final = np.dot(self.xyz_final - centroid_mics, rotation_matrix.T) + centroid_mics
+            
+            # Update Visualization
+            self.plot_final_geometry()
+            self.align_status.setText(f"Aligned principal axis (Mics) to {target_str}")
+            self.statusBar().showMessage(f"Geometry rotated (Mics-based) to align principal to {target_str}")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Rotation Error", f"Failed to rotate geometry: {str(e)}")
+
     # ==================== Visualization ====================
     def plot_toa_matrix(self):
         """Plot the TOA matrix"""
@@ -2556,7 +2771,7 @@ class GeoCalibApp(QMainWindow):
             QMessageBox.warning(self, "Error", "No TOA matrix available")
             return
         
-        import matplotlib.pyplot as plt
+        # import matplotlib.pyplot as plt # Already imported at module level
         fig = plt.figure(figsize=(12, 6))
         plt.pcolormesh(self.toa_matrix.T, cmap='jet')
         plt.colorbar(label='Time of Arrival (s)')
@@ -2568,93 +2783,10 @@ class GeoCalibApp(QMainWindow):
     
     def plot_final_geometry(self):
         """Plot final geometry in 3D with colors by microphone index"""
-        if self.xyz_final is None:
-            QMessageBox.warning(self, "Error", "No geometry data available")
-            return
-        
-        self.view_3d.clear()
-        
-        # Add grid and axis
-        grid = gl.GLGridItem()
-        self.view_3d.addItem(grid)
-        axis = gl.GLAxisItem()
-        axis.setSize(1, 1, 1)
-        self.view_3d.addItem(axis)
-        
-        # Determine Ns (Sources) and split if possible
-        Ns = getattr(self, 'solver_Ns', 0)
-        if Ns == 0 and self.toa_matrix is not None:
-             # If toa_matrix is (NbFiles, NbMics), then Ns is NbFiles
-             if self.toa_matrix.ndim == 2:
-                 Ns = self.toa_matrix.shape[0]
-             
-        xyz = self.xyz_final
-        
-        # Sources part
-        sources = np.array([])
-        mics = xyz
-        
-        if Ns > 0 and xyz.shape[0] > Ns:
-             sources = xyz[:Ns]
-             mics = xyz[Ns:]
-
-        # Calculate scaling based on TOA * C
-        temp_kelvin = self.temperature + 273.15
-        c_sound = np.sqrt(1.4 * 287 * temp_kelvin)
-        
-        if self.toa_matrix is not None:
-             valid_toas = self.toa_matrix[~np.isnan(self.toa_matrix)]
-             if valid_toas.size > 0:
-                 antenna_max_dim = np.ptp(valid_toas) * c_sound
-             else:
-                 antenna_max_dim = 1.0
+        if getattr(self, 'xyz_final', None) is not None:
+            self._update_3d_scene(self.xyz_final, highlight_refs=True)
         else:
-            antenna_max_dim = 1.0
-        
-        if antenna_max_dim == 0: antenna_max_dim = 1.0
-             
-        if Ns > 0 and xyz.shape[0] > Ns:
-             # Plot Sources (Grey, Large) - Using ScatterPlot for stability
-             scatter_sources = gl.GLScatterPlotItem(
-                 pos=sources, 
-                 color=(0.5, 0.5, 0.5, 1), 
-                 size=0.05 * antenna_max_dim, 
-                 pxMode=False
-             )
-             self.view_3d.addItem(scatter_sources)
-        
-        # Plot Microphones (Color by index)
-        # Create colors based on microphone index
-        num_mics = mics.shape[0]
-        color_values = np.arange(num_mics) / (num_mics - 1) if num_mics > 1 else np.array([0.5])
-        colors_rgba = plt.cm.hsv(color_values)  # (N, 4) RGBA array
-        
-        # Use ScatterPlotItem with per-point colors
-        scatter_mics = gl.GLScatterPlotItem(
-            pos=mics,
-            color=colors_rgba,
-            size=0.025 * antenna_max_dim,
-            pxMode=False
-        )
-        self.view_3d.addItem(scatter_mics)
-        
-        # Highlight reference mics if available
-        if self.mic_indices is not None:
-            ref_mics_pos = []
-            ref_colors = []
-            for mic_idx in self.mic_indices:
-                if mic_idx < len(mics):
-                    ref_mics_pos.append(mics[mic_idx])
-                    ref_colors.append(colors_rgba[mic_idx])
-            
-            if ref_mics_pos:
-                scatter_refs = gl.GLScatterPlotItem(
-                    pos=np.array(ref_mics_pos),
-                    color=np.array(ref_colors),
-                    size=15,  # Larger
-                    pxMode=True
-                )
-                self.view_3d.addItem(scatter_refs)
+            QMessageBox.warning(self, "Error", "No geometry data available")
     
     # ==================== Animation ====================
     def play_animation(self):
@@ -2686,99 +2818,25 @@ class GeoCalibApp(QMainWindow):
         
         max_frames = len(self.xyz_iters)
         
-        # Update 3D visualization
-        self.view_3d.clear()
-        grid = gl.GLGridItem()
-        self.view_3d.addItem(grid)
-        axis = gl.GLAxisItem()
-        axis.setSize(1, 1, 1)
-        self.view_3d.addItem(axis)
-        
-        xyz = self.xyz_iters[self.current_frame]
-        
-        # Determine Ns (sources) count
-        Ns = 0
-        if hasattr(self, 'solver_Ns') and self.solver_Ns is not None:
-            Ns = self.solver_Ns
-        elif self.toa_matrix is not None:
-            Ns = self.toa_matrix.shape[0]
-            
-        import matplotlib.pyplot as plt
-        
-        if Ns > 0 and xyz.shape[0] > Ns:
-            # Plot Sources (first Ns points) - Green, larger
-            sources_xyz = xyz[:Ns]
-            mics_xyz = xyz[Ns:]
-
-            # Calculate scaling based on TOA * C
-            temp_kelvin = self.temperature + 273.15
-            c_sound = np.sqrt(1.4 * 287 * temp_kelvin)
-            
-            if self.toa_matrix is not None:
-                valid_toas = self.toa_matrix[~np.isnan(self.toa_matrix)]
-                if valid_toas.size > 0:
-                    antenna_max_dim = np.ptp(valid_toas) * c_sound
-                else:
-                    antenna_max_dim = 1.0
-            else:
-                antenna_max_dim = 1.0
-            
-            if antenna_max_dim == 0: antenna_max_dim = 1.0
-
-            scatter_sources = gl.GLScatterPlotItem(
-                pos=sources_xyz,
-                color=(0.5, 0.5, 0.5, 1),
-                size=0.05 * antenna_max_dim,
-                pxMode=False
-            )
-            self.view_3d.addItem(scatter_sources)
-            
-            # Plot Microphones (remaining points) - Color by index
-            num_mics = mics_xyz.shape[0]
-            color_values = np.arange(num_mics) / (num_mics - 1) if num_mics > 1 else np.array([0.5])
-            colors_rgba = plt.cm.hsv(color_values)
-
-            scatter_mics = gl.GLScatterPlotItem(
-                pos=mics_xyz,
-                color=colors_rgba,
-                size=0.025 * antenna_max_dim,
-                pxMode=False
-            )
-            self.view_3d.addItem(scatter_mics)
-        else:
-            num_points = xyz.shape[0]
-            color_values = np.arange(num_points) / (num_points - 1) if num_points > 1 else np.array([0.5])
-            colors_rgba = plt.cm.hsv(color_values)
-            
-            # Calculate scaling based on TOA * C
-            temp_kelvin = self.temperature + 273.15
-            c_sound = np.sqrt(1.4 * 287 * temp_kelvin)
-            
-            if self.toa_matrix is not None:
-                valid_toas = self.toa_matrix[~np.isnan(self.toa_matrix)]
-                if valid_toas.size > 0:
-                    antenna_max_dim = np.ptp(valid_toas) * c_sound
-                else:
-                    antenna_max_dim = 1.0
-            else:
-                antenna_max_dim = 1.0
-                
-            if antenna_max_dim == 0: antenna_max_dim = 1.0
-
-            scatter = gl.GLScatterPlotItem(
-                pos=xyz,
-                color=colors_rgba,
-                size=0.025 * antenna_max_dim,
-                pxMode=False
-            )
-            self.view_3d.addItem(scatter)
-        
-        self.frame_label.setText(f"Frame: {self.current_frame} / {max_frames-1}")
-        
-        self.current_frame += 1
         if self.current_frame >= max_frames:
+             self.animation_timer.stop()
+             self.statusBar().showMessage("Animation finished")
+             return
+
+        # Get current frame data
+        try:
+            xyz = self.xyz_iters[self.current_frame]
+            
+            # Update Scene using shared helper
+            self._update_3d_scene(xyz, highlight_refs=False)
+            
+            self.frame_label.setText(f"Frame: {self.current_frame} / {max_frames-1}")
+            
+            self.current_frame += 1
+            
+        except Exception as e:
+            print(f"Animation error: {e}")
             self.animation_timer.stop()
-            self.statusBar().showMessage("Animation finished")
     
     def save_animation(self):
         """Save animation to video file"""
@@ -2797,7 +2855,7 @@ class GeoCalibApp(QMainWindow):
             try:
                 self.statusBar().showMessage("Saving animation...")
                 from matplotlib.animation import FuncAnimation, FFMpegWriter
-                import matplotlib.pyplot as plt
+                # import matplotlib.pyplot as plt # Already imported at module level
                 from mpl_toolkits.mplot3d import Axes3D
                 
                 L = np.max(np.abs(self.xyz_iters))
