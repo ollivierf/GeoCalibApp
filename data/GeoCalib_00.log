@@ -1,0 +1,161 @@
+[DEFAULT]
+
+[Date]
+Date = 14/09/2026     %jour/mois/année
+Heure = 15:39:23
+
+[Voies]
+Nb_faisceaux = 128
+Nb_voies = 482
+Nb_micros_actifs = 480
+Nb_voies_analogiques = 1
+Nb_compteurs = 1
+
+[Micros actifs]
+Faisceau_000  1  1  1  1  1  1  1  1
+Faisceau_001  1  1  1  1  1  1  1  1
+Faisceau_002  1  1  1  1  1  1  1  1
+Faisceau_003  1  1  1  1  1  1  1  1
+Faisceau_004  1  1  1  1  1  1  1  1
+Faisceau_005  1  1  1  1  1  1  1  1
+Faisceau_006  1  1  1  1  1  1  1  1
+Faisceau_007  1  1  1  1  1  1  1  1
+Faisceau_008  1  1  1  1  1  1  1  1
+Faisceau_009  1  1  1  1  1  1  1  1
+Faisceau_010  1  1  1  1  1  1  1  1
+Faisceau_011  1  1  1  1  1  1  1  1
+Faisceau_012  1  1  1  1  1  1  1  1
+Faisceau_013  1  1  1  1  1  1  1  1
+Faisceau_014  1  1  1  1  1  1  1  1
+Faisceau_015  1  1  1  1  1  1  1  1
+Faisceau_016  1  1  1  1  1  1  1  1
+Faisceau_017  1  1  1  1  1  1  1  1
+Faisceau_018  1  1  1  1  1  1  1  1
+Faisceau_019  1  1  1  1  1  1  1  1
+Faisceau_020  1  1  1  1  1  1  1  1
+Faisceau_021  1  1  1  1  1  1  1  1
+Faisceau_022  1  1  1  1  1  1  1  1
+Faisceau_023  1  1  1  1  1  1  1  1
+Faisceau_024  1  1  1  1  1  1  1  1
+Faisceau_025  1  1  1  1  1  1  1  1
+Faisceau_026  1  1  1  1  1  1  1  1
+Faisceau_027  1  1  1  1  1  1  1  1
+Faisceau_028  1  1  1  1  1  1  1  1
+Faisceau_029  1  1  1  1  1  1  1  1
+Faisceau_030  1  1  1  1  1  1  1  1
+Faisceau_031  1  1  1  1  1  1  1  1
+Faisceau_032  1  1  1  1  1  1  1  1
+Faisceau_033  1  1  1  1  1  1  1  1
+Faisceau_034  1  1  1  1  1  1  1  1
+Faisceau_035  1  1  1  1  1  1  1  1
+Faisceau_036  1  1  1  1  1  1  1  1
+Faisceau_037  1  1  1  1  1  1  1  1
+Faisceau_038  1  1  1  1  1  1  1  1
+Faisceau_039  1  1  1  1  1  1  1  1
+Faisceau_040  1  1  1  1  1  1  1  1
+Faisceau_041  1  1  1  1  1  1  1  1
+Faisceau_042  1  1  1  1  1  1  1  1
+Faisceau_043  1  1  1  1  1  1  1  1
+Faisceau_044  1  1  1  1  1  1  1  1
+Faisceau_045  1  1  1  1  1  1  1  1
+Faisceau_046  1  1  1  1  1  1  1  1
+Faisceau_047  1  1  1  1  1  1  1  1
+Faisceau_048  1  1  1  1  1  1  1  1
+Faisceau_049  1  1  1  1  1  1  1  1
+Faisceau_050  1  1  1  1  1  1  1  1
+Faisceau_051  1  1  1  1  1  1  1  1
+Faisceau_052  1  1  1  1  1  1  1  1
+Faisceau_053  1  1  1  1  1  1  1  1
+Faisceau_054  1  1  1  1  1  1  1  1
+Faisceau_055  1  1  1  1  1  1  1  1
+Faisceau_056  1  1  1  1  1  1  1  1
+Faisceau_057  1  1  1  1  1  1  1  1
+Faisceau_058  1  1  1  1  1  1  1  1
+Faisceau_059  1  1  1  1  1  1  1  1
+Faisceau_060  0  0  0  0  0  0  0  0
+Faisceau_061  0  0  0  0  0  0  0  0
+Faisceau_062  0  0  0  0  0  0  0  0
+Faisceau_063  0  0  0  0  0  0  0  0
+Faisceau_064  0  0  0  0  0  0  0  0
+Faisceau_065  0  0  0  0  0  0  0  0
+Faisceau_066  0  0  0  0  0  0  0  0
+Faisceau_067  0  0  0  0  0  0  0  0
+Faisceau_068  0  0  0  0  0  0  0  0
+Faisceau_069  0  0  0  0  0  0  0  0
+Faisceau_070  0  0  0  0  0  0  0  0
+Faisceau_071  0  0  0  0  0  0  0  0
+Faisceau_072  0  0  0  0  0  0  0  0
+Faisceau_073  0  0  0  0  0  0  0  0
+Faisceau_074  0  0  0  0  0  0  0  0
+Faisceau_075  0  0  0  0  0  0  0  0
+Faisceau_076  0  0  0  0  0  0  0  0
+Faisceau_077  0  0  0  0  0  0  0  0
+Faisceau_078  0  0  0  0  0  0  0  0
+Faisceau_079  0  0  0  0  0  0  0  0
+Faisceau_080  0  0  0  0  0  0  0  0
+Faisceau_081  0  0  0  0  0  0  0  0
+Faisceau_082  0  0  0  0  0  0  0  0
+Faisceau_083  0  0  0  0  0  0  0  0
+Faisceau_084  0  0  0  0  0  0  0  0
+Faisceau_085  0  0  0  0  0  0  0  0
+Faisceau_086  0  0  0  0  0  0  0  0
+Faisceau_087  0  0  0  0  0  0  0  0
+Faisceau_088  0  0  0  0  0  0  0  0
+Faisceau_089  0  0  0  0  0  0  0  0
+Faisceau_090  0  0  0  0  0  0  0  0
+Faisceau_091  0  0  0  0  0  0  0  0
+Faisceau_092  0  0  0  0  0  0  0  0
+Faisceau_093  0  0  0  0  0  0  0  0
+Faisceau_094  0  0  0  0  0  0  0  0
+Faisceau_095  0  0  0  0  0  0  0  0
+Faisceau_096  0  0  0  0  0  0  0  0
+Faisceau_097  0  0  0  0  0  0  0  0
+Faisceau_098  0  0  0  0  0  0  0  0
+Faisceau_099  0  0  0  0  0  0  0  0
+Faisceau_100  0  0  0  0  0  0  0  0
+Faisceau_101  0  0  0  0  0  0  0  0
+Faisceau_102  0  0  0  0  0  0  0  0
+Faisceau_103  0  0  0  0  0  0  0  0
+Faisceau_104  0  0  0  0  0  0  0  0
+Faisceau_105  0  0  0  0  0  0  0  0
+Faisceau_106  0  0  0  0  0  0  0  0
+Faisceau_107  0  0  0  0  0  0  0  0
+Faisceau_108  0  0  0  0  0  0  0  0
+Faisceau_109  0  0  0  0  0  0  0  0
+Faisceau_110  0  0  0  0  0  0  0  0
+Faisceau_111  0  0  0  0  0  0  0  0
+Faisceau_112  0  0  0  0  0  0  0  0
+Faisceau_113  0  0  0  0  0  0  0  0
+Faisceau_114  0  0  0  0  0  0  0  0
+Faisceau_115  0  0  0  0  0  0  0  0
+Faisceau_116  0  0  0  0  0  0  0  0
+Faisceau_117  0  0  0  0  0  0  0  0
+Faisceau_118  0  0  0  0  0  0  0  0
+Faisceau_119  0  0  0  0  0  0  0  0
+Faisceau_120  0  0  0  0  0  0  0  0
+Faisceau_121  0  0  0  0  0  0  0  0
+Faisceau_122  0  0  0  0  0  0  0  0
+Faisceau_123  0  0  0  0  0  0  0  0
+Faisceau_124  0  0  0  0  0  0  0  0
+Faisceau_125  0  0  0  0  0  0  0  0
+Faisceau_126  0  0  0  0  0  0  0  0
+Faisceau_127  0  0  0  0  0  0  0  0
+
+[VA actives]
+Bloc_A =   1  0  0  0
+Bloc_B =   0  0  0  0
+Bloc_C =   0  0  0  0
+Bloc_D =   0  0  0  0
+
+[Compteurs actifs]
+Compteurs =   1  0  0  0
+
+[Acquisition]
+Freq = 50000      ; (Hz)
+Duree = 79,5       ; (s)
+Nb_ech = 3973720
+Type = int32
+
+
+[OPTIONNAL]
+

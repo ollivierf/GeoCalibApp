@@ -385,7 +385,9 @@ class GCCValidationDialog(QDialog):
             
             if len(gcce_range) > 0:
                 # Find all peaks in this range
-                peaks, properties = sig.find_peaks(gcce_range, height=0)
+                noise_samples = self.gcce_limited[i, :500]
+                rms_threshold = 5.0 * np.sqrt(np.mean(noise_samples**2))
+                peaks, properties = sig.find_peaks(gcce_range, height=rms_threshold)
                 
                 if len(peaks) > 0:
                     # Get peak heights
@@ -772,7 +774,8 @@ class ProcessingThread(QThread):
                 GCCE[i, :] = row_env.astype(np.float32)
                 
                 # Peak Finding
-                peaks, properties = sig.find_peaks(row_env, height=0)
+                rms_threshold = 5.0 * np.sqrt(np.mean(row_env[:500]**2))
+                peaks, properties = sig.find_peaks(row_env, height=rms_threshold)
                 
                 if len(peaks) > 0:
                     peak_heights = properties['peak_heights']
@@ -816,13 +819,14 @@ class SolverThread(QThread):
     error = pyqtSignal(str)
     
     def __init__(self, toa_matrix, initial_xyz=None, lambda_param=0.050, 
-                 max_iter=10000, eps_limit=1e-10, temp_celsius=26, align_8=False, ndim=3):
+                 max_iter=10000, eps_limit=1e-10, temp_celsius=26, align_8=False, ndim=3, max_distance=0.0):
         super().__init__()
         # Input: TOA matrix with shape (NbFiles, NbMics) or (NbMics, NbMics) if 2D
         # TOA values are in seconds, need to be converted to distances via multiplication by C
         
         self.align_8 = align_8
         self.ndim = ndim
+        self.max_distance = max_distance
         self.toa_matrix = toa_matrix  # Store original for reference
         
         # Handle both 2D (single file) and 3D (multiple files) TOA arrays
@@ -971,6 +975,33 @@ class SolverThread(QThread):
                 # Update X
                 # X_new = X_old * L1 * Lpinv
                 X[t+1, :, :] = np.dot(X[t, :, :], np.dot(L1, Lpinv))
+                
+                # --- Max Distance Constraint ---
+                if self.max_distance > 0:
+                    current_X = X[t+1, :, Ns:Nr]
+                    # Iterative projection for constraints
+                    for _ in range(3): 
+                        # Squared pairwise distances
+                        diff = current_X[:, :, None] - current_X[:, None, :]
+                        dist_sq = np.sum(diff**2, axis=0)
+                        
+                        # Find violating pairs (upper triangle)
+                        violators = np.argwhere(np.triu(dist_sq, 1) > self.max_distance**2)
+                        
+                        if len(violators) == 0:
+                            break
+                            
+                        for i, j in violators:
+                            d = np.sqrt(dist_sq[i, j])
+                            if d < 1e-9: continue
+                            
+                            excess = (d - self.max_distance) / 2
+                            correction = (current_X[:, i] - current_X[:, j]) * (excess / d)
+                            
+                            current_X[:, i] -= correction
+                            current_X[:, j] += correction
+                            
+                    X[t+1, :, Ns:Nr] = current_X
                 
                 # Convergence
                 X_diff_norm = linalg.norm(X[t+1, :, :] - X[t, :, :])
@@ -1674,6 +1705,13 @@ class GeoCalibApp(QMainWindow):
         self.ndim_combo.setCurrentIndex(2) # Default 3
         param_layout.addRow("Dimension (Ndim):", self.ndim_combo)
 
+        self.max_dist_spin = QDoubleSpinBox()
+        self.max_dist_spin.setValue(0.0)
+        self.max_dist_spin.setMaximum(100.0)
+        self.max_dist_spin.setSingleStep(0.1)
+        self.max_dist_spin.setToolTip("Maximum allowed distance between any pair of microphones (0 = no constraint)")
+        param_layout.addRow("Max Mic Distance (m):", self.max_dist_spin)
+
         self.align8_check = QCheckBox("Alignement par 8")
         self.align8_check.setChecked(False)
         self.align8_check.setToolTip("Constrain microphones to be aligned by chunks of 8")
@@ -2216,7 +2254,8 @@ class GeoCalibApp(QMainWindow):
             eps_limit=10**(-self.eps_spin.value()),
             temp_celsius=self.temperature,
             align_8=self.align8_check.isChecked(),
-            ndim=int(self.ndim_combo.currentText())
+            ndim=int(self.ndim_combo.currentText()),
+            max_distance=self.max_dist_spin.value()
         )
         self.solver_thread.progress.connect(self.solver_progress.setValue)
         self.solver_thread.status.connect(self.solver_status.setText)
