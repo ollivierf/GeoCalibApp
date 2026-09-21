@@ -15,6 +15,7 @@ h5py>=3.0.0
 # Visualization
 pyqtgraph>=0.14.0
 matplotlib>=3.3.0
+plotly>=5.0.0
 
 # Local solver (relative path)
 ./rcbox
