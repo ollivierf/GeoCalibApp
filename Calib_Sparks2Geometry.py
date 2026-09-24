@@ -99,11 +99,22 @@ BeamAlignTol = 0.005  # m, mandatory but allows this much slack off the ideal co
 # BeamDirTolDeg -- vertical beams are grossly parallel to every other vertical beam
 # even across different (perpendicular) side faces, since "vertical" is a single
 # shared direction regardless of which face it's on; only top-vs-side beams are
-# perpendicular. A violation flags a suspect beam (bad slot assignment or bad TOA
-# data for that beam) rather than a real physical deviation, since neither should
-# happen on the real rig.
+# perpendicular. A DeviationTolM violation flags a suspect beam (bad slot assignment
+# or bad TOA data for that beam) rather than a real physical deviation, since neither
+# should happen on the real rig -- so rather than merge a suspect solve, that
+# subset's RMDU solve is discarded and re-run from fresh random inits (see
+# MaxSubsetRetries below and the Stage 2 retry loop). BeamDirTolDeg violations stay
+# print-only diagnostics.
 DeviationTolM = 0.20   # m
 BeamDirTolDeg = 15.0   # deg
+
+# How many times a subset's RMDU solve is discarded and retried (fresh random inits,
+# see run_rmdu_two_step_best_of's seed_offset) after merging it produces a mic more
+# than DeviationTolM from its template-snapped position. Bounded rather than
+# unbounded so a subset whose TOA data is itself bad (not just an unlucky RMDU
+# local minimum) can't hang the run forever -- after MaxSubsetRetries attempts the
+# best (last) attempt is kept and a warning printed instead.
+MaxSubsetRetries = 5
 
 Lambda1 = 0.05      # step 1: rough geometry
 Lambda2 = 2.0        # step 2: refined geometry
@@ -1066,7 +1077,8 @@ def beam_residual_scores(toa_matrix, mems, subset, XYZ, Ns, temp_celsius=TempCel
     return worst_mic_score, worst_beam_score, median_score
 
 
-def run_rmdu_two_step_best_of(toa_matrix, mems, subset, lambda1, lambda2, n_restarts=NbRestarts, label="", **kwargs):
+def run_rmdu_two_step_best_of(toa_matrix, mems, subset, lambda1, lambda2, n_restarts=NbRestarts,
+                               seed_offset=0, label="", **kwargs):
     """
     Runs the full rough (lambda1) -> refine (lambda2) pipeline from
     n_restarts random inits and keeps whichever restart's *refined* result
@@ -1077,10 +1089,16 @@ def run_rmdu_two_step_best_of(toa_matrix, mems, subset, lambda1, lambda2, n_rest
     restart that looked mediocre after the rough step can refine into the
     best final result, and vice versa -- every restart earns its own refine
     pass before any of them is judged.
+
+    seed_offset shifts the seed range (seed_offset .. seed_offset+n_restarts-1)
+    instead of always 0..n_restarts-1, so a caller retrying this subset after a
+    DeviationTolM violation (see MaxSubsetRetries) draws a genuinely fresh set
+    of random inits each attempt rather than deterministically reproducing the
+    same rejected solve.
     """
     temp_celsius = kwargs.get("temp_celsius", TempCelsius)
     best = None
-    for seed in range(n_restarts):
+    for seed in range(seed_offset, seed_offset + n_restarts):
         XYZ1, Ns1, eps1, it1 = run_rmdu(toa_matrix, mems, subset, lambda1, seed=seed,
                                          label=f"{label}-step1-seed{seed}", **kwargs)
         XYZ2, Ns2, eps2, it2 = run_rmdu(toa_matrix, mems, subset, lambda2, initial_xyz=XYZ1,
@@ -1220,18 +1238,26 @@ def check_beam_geometry(state, mems, mic_xyz_global, new_beams, idx):
     top face, vertical for every side face regardless of which one), so
     this also checks that vertical beams are grossly parallel to every
     other vertical beam even across different (perpendicular) side faces,
-    and only top-vs-side beams are perpendicular. Both are print-only
-    diagnostics: a violation means the beam's slot assignment or TOA data
-    is suspect, not that the rig itself deviates -- neither should happen
-    on the real array.
+    and only top-vs-side beams are perpendicular. The direction check is a
+    print-only diagnostic. The deviation check is not: it's the caller's
+    signal (via this function's return value) to discard and retry the
+    whole subset solve (see MaxSubsetRetries in the Stage 2 loop) rather
+    than merge a suspect beam into the shared geometry -- a violation means
+    the beam's slot assignment or TOA data is suspect, not that the rig
+    itself deviates, since neither should happen on the real array.
+
+    Returns the largest single-mic deviation (m) seen across new_beams (0.0
+    if new_beams is empty), so the caller can compare it to DeviationTolM.
     """
     mem_to_local = {m: i for i, m in enumerate(mems)}
     R = state["R"]
+    max_dev = 0.0
     for b in new_beams:
         slot = state["slot_of_beam"][b]
         beam_mems = list(range(b * BeamSize, b * BeamSize + BeamSize))
 
         devs = [(m, np.linalg.norm(state["raw_xyz"][m] - state["merged_xyz"][m])) for m in beam_mems]
+        max_dev = max(max_dev, max((d for _, d in devs), default=0.0))
         bad = [(m, d) for m, d in devs if d > DeviationTolM]
         if bad:
             print(f"    [check] subset {idx:02d} beam {b}: {len(bad)}/{len(beam_mems)} mic(s) exceed the "
@@ -1246,6 +1272,8 @@ def check_beam_geometry(state, mems, mic_xyz_global, new_beams, idx):
                   f"{angle:.1f} deg off its slot's expected direction (> {BeamDirTolDeg:.0f} deg tolerance -- "
                   f"should be parallel to every other {TemplateClass[slot]}-class beam, "
                   f"perpendicular to beams of the other class)")
+
+    return max_dev
 
 
 #%%
@@ -1367,19 +1395,48 @@ for idx, subset in enumerate(Subsets):
 
     live_plotter = make_live_plotter(Ax1, mems, BeamColors, idx)
 
-    print(f"Subset {idx:02d}: {NbRestarts} restarts, each rough (lambda={Lambda1}) then refined (lambda={Lambda2}) ...")
-    XYZ2, Ns2, eps2, it2 = run_rmdu_two_step_best_of(toa, mems, subset, Lambda1, Lambda2, label=f"{idx:02d}",
-                                                      progress_every=0, plot_every=PlotEvery,
-                                                      plot_callback=live_plotter)
+    # Retry loop: a subset whose merge puts any mic more than DeviationTolM from
+    # its template-snapped position gets its RMDU solve discarded (rolled back
+    # out of MergeState) and re-run from fresh random inits (seed_offset), up to
+    # MaxSubsetRetries times, rather than silently merging a suspect beam.
+    for attempt in range(MaxSubsetRetries):
+        print(f"Subset {idx:02d} attempt {attempt + 1}/{MaxSubsetRetries}: {NbRestarts} restarts, "
+              f"each rough (lambda={Lambda1}) then refined (lambda={Lambda2}) ...")
+        XYZ2, Ns2, eps2, it2 = run_rmdu_two_step_best_of(toa, mems, subset, Lambda1, Lambda2, label=f"{idx:02d}",
+                                                          seed_offset=attempt * NbRestarts,
+                                                          progress_every=0, plot_every=PlotEvery,
+                                                          plot_callback=live_plotter)
 
-    mic_xyz = XYZ2[Ns2:, :]
-    src_xyz = XYZ2[:Ns2, :]
+        mic_xyz = XYZ2[Ns2:, :]
+        src_xyz = XYZ2[:Ns2, :]
 
-    before_merged = set(MergeState["merged_xyz"].keys())
-    mic_xyz_global = merge_subset_into_cube(MergeState, subset, mems, mic_xyz)
-    MergedXYZ = MergeState["merged_xyz"]
-    new_beams = sorted({m // BeamSize for m in MergedXYZ.keys() if m not in before_merged})
-    check_beam_geometry(MergeState, mems, mic_xyz_global, new_beams, idx)
+        was_bootstrap = MergeState["R"] is None
+        before_merged = set(MergeState["merged_xyz"].keys())
+        mic_xyz_global = merge_subset_into_cube(MergeState, subset, mems, mic_xyz)
+        MergedXYZ = MergeState["merged_xyz"]
+        new_beams = sorted({m // BeamSize for m in MergedXYZ.keys() if m not in before_merged})
+        max_dev = check_beam_geometry(MergeState, mems, mic_xyz_global, new_beams, idx)
+
+        if max_dev <= DeviationTolM:
+            break
+
+        if attempt == MaxSubsetRetries - 1:
+            print(f"Subset {idx:02d}: still {max_dev:.3f}m > {DeviationTolM:.2f}m after {MaxSubsetRetries} attempts "
+                  f"-- keeping this attempt's result rather than retrying further.")
+            break
+
+        print(f"Subset {idx:02d}: deviation {max_dev:.3f}m exceeds {DeviationTolM:.2f}m -- "
+              f"discarding this solve and restarting with fresh random inits.")
+        for m in (MergedXYZ.keys() - before_merged):
+            del MergeState["merged_xyz"][m]
+            del MergeState["raw_xyz"][m]
+        for b in new_beams:
+            slot = MergeState["slot_of_beam"].pop(b, None)
+            if slot is not None:
+                MergeState["used_slots"].discard(slot)
+        if was_bootstrap:
+            MergeState["R"] = None
+            MergeState["origin"] = None
 
     np.savez(os.path.join(GeometryDir, f"subset_{idx:02d}_geometry.npz"),
              mems=np.array(mems), mic_xyz_local=mic_xyz, mic_xyz_global=mic_xyz_global,
