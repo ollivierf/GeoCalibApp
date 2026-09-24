@@ -18,6 +18,7 @@
 # per-subset .npy/.png artifacts are still written for inspection, but
 # nothing is re-read back off disk to drive the geometry stage.
 import os
+import sys
 import json
 import numpy as np
 import numpy.linalg as la
@@ -30,6 +31,7 @@ from tqdm import tqdm
 from scipy.spatial.distance import squareform, pdist
 from scipy.spatial import ConvexHull
 from scipy.optimize import linear_sum_assignment
+from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
 try:
     from scipy.spatial import QhullError
 except ImportError:
@@ -39,7 +41,18 @@ from rcbox.rmds import compute_Lpinv
 from Calib_Geometry2Browser import build_comparison_html
 
 # ---- Raw data / subset split / TDOA extraction ----
-fin = "data/GeoCalib_00.dat"
+# A QApplication is required before any QFileDialog/QMessageBox can be shown --
+# reused if one already exists (e.g. this script imported from inside another
+# Qt app) instead of instantiating a second one, which Qt does not allow.
+QtApp = QApplication.instance() or QApplication(sys.argv)
+
+fin, _ = QFileDialog.getOpenFileName(
+    None, "Select the raw spark data file (.dat)", "data",
+    "DAT files (*.dat);;All files (*.*)")
+if not fin:
+    QMessageBox.information(None, "Cancelled", "No input file selected -- exiting.")
+    sys.exit(0)
+
 SubsetsDir = "results/subsets"
 GeometryDir = "results/geometry"
 NbMems = 480
@@ -1392,6 +1405,24 @@ print(f"  raw-vs-snapped deviation: mean={deviation.mean():.4f}m median={np.medi
 
 build_comparison_html(np.array(merged_mems_sorted), merged_xyz_arr, raw_xyz_arr,
                        os.path.join(GeometryDir, "merged_geometry_compare.html"))
+
+#%%
+# ---- Final export: user-chosen file, measured mic geometry as XYZm ----
+DefaultOutName = os.path.splitext(os.path.basename(fin))[0] + "_XYZm.npz"
+OutPath, _ = QFileDialog.getSaveFileName(
+    None, "Save final geometry as", os.path.join(GeometryDir, DefaultOutName),
+    "NumPy Compressed (*.npz)")
+if OutPath:
+    if not OutPath.lower().endswith(".npz"):
+        OutPath += ".npz"
+    np.savez(OutPath, XYZm=merged_xyz_arr, mems=np.array(merged_mems_sorted))
+    QMessageBox.information(None, "Saved", f"Final geometry (XYZm) saved to:\n{OutPath}")
+    print(f"Final geometry saved (XYZm, {merged_xyz_arr.shape[0]} mics) -> {OutPath}")
+else:
+    QMessageBox.information(None, "Not saved",
+        "No output file chosen -- the final geometry was not exported.\n"
+        f"(The full run's diagnostic copy is still at "
+        f"{os.path.join(GeometryDir, 'merged_geometry.npz')}.)")
 
 plt.ioff()
 plt.show()
